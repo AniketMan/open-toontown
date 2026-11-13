@@ -12,7 +12,9 @@ aux-display tinydisplay
 depth-bits 24
 audio-sfx-active #t
 audio-music-active #t
-aspect-ratio 1.333333
+# 0 lets the picture follow the window's shape.  The original 1.333333
+# forced a 4:3 picture, which stretched in any wider window.
+aspect-ratio 0
 
 # Models/Resources
 model-path resources

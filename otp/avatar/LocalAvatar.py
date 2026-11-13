@@ -19,6 +19,47 @@ from direct.controls.ObserverWalker import ObserverWalker
 from direct.controls.SwimWalker import SwimWalker
 from direct.controls.TwoDWalker import TwoDWalker
 
+class WASDControlManager(ControlManager.ControlManager):
+    """Adds W/A/S/D to the arrow keys: W and S walk, A and D turn.
+    Jump stays on Control.  'wasd-movement 0' turns this off."""
+    wantWASDKeys = ConfigVariableBool('wasd-movement', True)
+
+    WASD_KEYS = (('forward', 'w'), ('reverse', 's'), ('turnLeft', 'a'), ('turnRight', 'd'))
+
+    def enable(self):
+        wasEnabled = self.isEnabled
+        ControlManager.ControlManager.enable(self)
+        if not wasEnabled:
+            self.__watchWASD()
+
+    def disable(self):
+        self.__unwatchWASD()
+        ControlManager.ControlManager.disable(self)
+
+    def setTyping(self, typing):
+        """While the chat box is open the letter keys type, not walk."""
+        self.__typing = typing
+        if typing:
+            self.__unwatchWASD()
+        elif self.isEnabled:
+            self.__watchWASD()
+
+    def __watchWASD(self):
+        if not self.wantWASDKeys or getattr(self, '_WASDControlManager__typing', False):
+            return
+        if getattr(self, '_WASDControlManager__tokens', None):
+            return
+        self.__tokens = [inputState.watchWithModifiers(state, key, inputSource=inputState.WASD)
+                         for state, key in self.WASD_KEYS]
+
+    def __unwatchWASD(self):
+        for token in getattr(self, '_WASDControlManager__tokens', None) or ():
+            token.release()
+        self.__tokens = []
+        for state, key in self.WASD_KEYS:
+            inputState.set(state, False, inputSource=inputState.WASD)
+
+
 class LocalAvatar(DistributedAvatar.DistributedAvatar, DistributedSmoothNode.DistributedSmoothNode):
     notify = DirectNotifyGlobal.directNotify.newCategory('LocalAvatar')
     wantDevCameraPositions = ConfigVariableBool('want-dev-camera-positions', 0).value
@@ -43,7 +84,8 @@ class LocalAvatar(DistributedAvatar.DistributedAvatar, DistributedSmoothNode.Dis
         base.pushCTrav(self.cTrav)
         self.cTrav.setRespectPrevTransform(1)
         self.avatarControlsEnabled = 0
-        self.controlManager = ControlManager.ControlManager(True, passMessagesThrough)
+        self.controlManager = WASDControlManager(True, passMessagesThrough)
+        self.accept('chatInputActive', self.controlManager.setTyping)
         self.initializeCollisions()
         self.initializeSmartCamera()
         self.cameraPositions = []
@@ -933,22 +975,38 @@ class LocalAvatar(DistributedAvatar.DistributedAvatar, DistributedSmoothNode.Dis
     def enableRun(self):
         self.accept('arrow_up', self.startRunWatch)
         self.accept('arrow_up-up', self.stopRunWatch)
+        self.accept('w', self.startRunWatch)
+        self.accept('w-up', self.stopRunWatch)
         self.accept('control-arrow_up', self.startRunWatch)
         self.accept('control-arrow_up-up', self.stopRunWatch)
+        self.accept('control-w', self.startRunWatch)
+        self.accept('control-w-up', self.stopRunWatch)
         self.accept('alt-arrow_up', self.startRunWatch)
         self.accept('alt-arrow_up-up', self.stopRunWatch)
+        self.accept('alt-w', self.startRunWatch)
+        self.accept('alt-w-up', self.stopRunWatch)
         self.accept('shift-arrow_up', self.startRunWatch)
         self.accept('shift-arrow_up-up', self.stopRunWatch)
+        self.accept('shift-w', self.startRunWatch)
+        self.accept('shift-w-up', self.stopRunWatch)
 
     def disableRun(self):
         self.ignore('arrow_up')
         self.ignore('arrow_up-up')
+        self.ignore('w')
+        self.ignore('w-up')
         self.ignore('control-arrow_up')
         self.ignore('control-arrow_up-up')
+        self.ignore('control-w')
+        self.ignore('control-w-up')
         self.ignore('alt-arrow_up')
         self.ignore('alt-arrow_up-up')
+        self.ignore('alt-w')
+        self.ignore('alt-w-up')
         self.ignore('shift-arrow_up')
         self.ignore('shift-arrow_up-up')
+        self.ignore('shift-w')
+        self.ignore('shift-w-up')
 
     def startRunWatch(self):
 

@@ -32,6 +32,11 @@ except:
     launcher = ToontownDummyLauncher()
     builtins.launcher = launcher
 
+from toontown.toonbase import HDTextures
+HDTextures.enable()
+from toontown.toonbase import HiDPI
+HiDPI.prepare()
+
 launcher.setRegistry('EXIT_PAGE', 'normal')
 pollingDelay = 0.5
 print('ToontownStart: Polling for game2 to finish...')

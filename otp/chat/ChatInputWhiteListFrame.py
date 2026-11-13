@@ -167,12 +167,14 @@ class ChatInputWhiteListFrame(FSM.FSM, DirectFrame):
         self.show()
         self.active = 1
         self.chatEntry.guiItem.setAcceptEnabled(False)
+        messenger.send('chatInputActive', [True])
 
     def deactivate(self):
         self.chatEntry.set('')
         self.chatEntry['focus'] = 0
         self.hide()
         self.active = 0
+        messenger.send('chatInputActive', [False])
 
     def isActive(self):
         return self.active

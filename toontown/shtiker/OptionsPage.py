@@ -364,7 +364,10 @@ class OptionsTabPage(DirectFrame):
             self.__setDisplaySettings()
             properties = base.win.getProperties()
             self.displaySettingsChanged = 1
-            self.displaySettingsSize = (properties.getXSize(), properties.getYSize())
+            # Saved in on-screen size; a Retina window reports real pixels.
+            from toontown.toonbase import HiDPI
+            zoom = HiDPI.zoom() if not properties.getFullscreen() else 1.0
+            self.displaySettingsSize = (int(round(properties.getXSize() / zoom)), int(round(properties.getYSize() / zoom)))
             self.displaySettingsFullscreen = properties.getFullscreen()
             self.displaySettingsEmbedded = self.isPropertiesEmbedded(properties)
             self.displaySettingsApi = base.pipe.getInterfaceName()

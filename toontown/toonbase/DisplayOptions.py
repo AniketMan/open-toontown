@@ -7,6 +7,7 @@ from panda3d.core import loadPrcFileData, WindowProperties
 from otp.otpgui import OTPDialog
 from otp.otpbase import OTPGlobals
 from otp.otpbase import OTPRender
+from toontown.toonbase import HiDPI
 from direct.directnotify import DirectNotifyGlobal
 try:
     import embedded
@@ -43,7 +44,8 @@ class DisplayOptions:
         if not mode and not self.isWindowedPossible():
             self.notify.warning('Windowed mode is not possible.')
             mode = True
-        loadPrcFileData('toonBase Settings Window Res', 'win-size %s %s' % (res[0], res[1]))
+        winSize = res if mode else HiDPI.pixels(res[0], res[1])
+        loadPrcFileData('toonBase Settings Window Res', 'win-size %s %s' % (winSize[0], winSize[1]))
         self.notify.debug('settings resolution = %s' % str(res))
         loadPrcFileData('toonBase Settings Window FullScreen', 'fullscreen %s' % mode)
         self.notify.debug('settings full screen mode=%s' % str(mode))
@@ -81,6 +83,8 @@ class DisplayOptions:
             if base.appRunner.windowProperties:
                 width = base.appRunner.windowProperties.getXSize()
                 height = base.appRunner.windowProperties.getYSize()
+        if not fullscreen and not embedded:
+            width, height = HiDPI.pixels(width, height)
         self.current_pipe = base.pipe
         self.current_properties = WindowProperties(base.win.getProperties())
         properties = self.current_properties

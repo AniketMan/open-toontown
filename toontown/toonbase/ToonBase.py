@@ -34,7 +34,9 @@ class ToonBase(OTPBase.OTPBase):
                 mode = 1
             if res == None:
                 res = (800, 600)
-            loadPrcFileData('toonBase Settings Window Res', 'win-size %s %s' % (res[0], res[1]))
+            from toontown.toonbase import HiDPI
+            winSize = res if mode else HiDPI.pixels(res[0], res[1])
+            loadPrcFileData('toonBase Settings Window Res', 'win-size %s %s' % (winSize[0], winSize[1]))
             loadPrcFileData('toonBase Settings Window FullScreen', 'fullscreen %s' % mode)
             loadPrcFileData('toonBase Settings Music Active', 'audio-music-active %s' % music)
             loadPrcFileData('toonBase Settings Sound Active', 'audio-sfx-active %s' % sfx)
@@ -76,6 +78,10 @@ class ToonBase(OTPBase.OTPBase):
             self.notify.debug('Enabling particles')
             self.enableParticles()
         self.accept(ToontownGlobals.ScreenshotHotkey, self.takeScreenShot)
+        from toontown.toonbase.PostFX import PostFX
+        self.postFx = PostFX(self)
+        # Frame counter in the corner; 'want-frame-counter 0' hides it.
+        self.setFrameRateMeter(self.config.GetBool('want-frame-counter', 1))
         self.accept('panda3d-render-error', self.panda3dRenderError)
         oldLoader = self.loader
         self.loader = ToontownLoader.ToontownLoader(self)
@@ -148,6 +154,19 @@ class ToonBase(OTPBase.OTPBase):
         self.oldY = max(1, base.win.getYSize())
         self.aspectRatio = float(self.oldX) / self.oldY
         return
+
+    def openMainWindow(self, *args, **kw):
+        # Changing display mode closes the window and opens a new one.  The
+        # effect buffers belong to the old window and crash the renderer if
+        # they outlive it, so take them down first and rebuild them after.
+        fx = getattr(self, 'postFx', None)
+        wasOn = fx is not None and fx.enabled
+        if wasOn:
+            fx.disable()
+        result = OTPBase.OTPBase.openMainWindow(self, *args, **kw)
+        if wasOn and result:
+            fx.enable()
+        return result
 
     def windowEvent(self, win):
         OTPBase.OTPBase.windowEvent(self, win)

@@ -37,17 +37,25 @@ class DisplaySettingsDialog(DirectFrame, StateData.StateData):
         self.isLoaded = 1
         self.anyChanged = 0
         self.apiChanged = 0
-        screenSizes = [(640, 480),
-         (800, 600),
-         (1024, 768),
-         (1280, 1024),
-         (1600, 1200)]
-        displayInfo = base.pipe.getDisplayInformation()
-        for i in range(displayInfo.getTotalDisplayModes()):
-            width = displayInfo.getDisplayModeWidth(i)
-            height = displayInfo.getDisplayModeHeight(i)
-            if (width, height) not in screenSizes:
-                screenSizes.append((width, height))
+        # A short list of sizes in the display's own shape, plus two
+        # classic 4:3 ones, all of which fit on this display.  (The list
+        # used to be every mode the display reports, which on a Mac is a
+        # couple of dozen near-duplicates.)
+        from toontown.toonbase import HiDPI
+        zoom = HiDPI.zoom() if not base.win.getProperties().getFullscreen() else 1.0
+        displayW = max(640, base.pipe.getDisplayWidth())
+        displayH = max(480, base.pipe.getDisplayHeight())
+        ratio = 16.0 / 9.0 if float(displayW) / displayH > 1.7 else 16.0 / 10.0
+        screenSizes = set()
+        for width in (800, 960, 1152, 1280, 1440, 1600, 1728, 1920, 2560, 3840):
+            height = int(round(width / ratio / 2.0)) * 2
+            if width <= displayW and height <= displayH:
+                screenSizes.add((width, height))
+        for size in ((800, 600), (1024, 768)):
+            if size[0] <= displayW and size[1] <= displayH:
+                screenSizes.add(size)
+        # Whatever is in use now stays selectable.
+        screenSizes.add((int(base.win.getXSize() / zoom), int(base.win.getYSize() / zoom)))
         self.screenSizes = sorted(screenSizes)
         guiButton = loader.loadModel('phase_3/models/gui/quit_button')
         gui = loader.loadModel('phase_3.5/models/gui/friendslist_gui')
@@ -114,7 +122,11 @@ class DisplaySettingsDialog(DirectFrame, StateData.StateData):
         self.revertDialog = None
         base.transitions.fadeScreen(0.5)
         properties = base.win.getProperties()
-        self.screenSizeIndex = self.chooseClosestScreenSize(properties.getXSize(), properties.getYSize())
+        # A window's size is in real pixels on a Retina display; the list
+        # is in the sizes the player sees.
+        from toontown.toonbase import HiDPI
+        zoom = HiDPI.zoom() if not properties.getFullscreen() else 1.0
+        self.screenSizeIndex = self.chooseClosestScreenSize(int(properties.getXSize() / zoom), int(properties.getYSize() / zoom))
         self.isFullscreen = properties.getFullscreen()
         if self.isCurrentlyEmbedded():
             self.displayMode = self.EmbeddedMode
@@ -311,6 +323,9 @@ class DisplaySettingsDialog(DirectFrame, StateData.StateData):
     def changeDisplayProperties(self, pipe, width, height, fullscreen = False, embedded = False):
         result = False
         self.notify.info('changeDisplayProperties')
+        if not fullscreen and not embedded:
+            from toontown.toonbase import HiDPI
+            width, height = HiDPI.pixels(width, height)
         if embedded:
             if DisplayOptions.isEmbeddedPossible():
                 width = base.appRunner.windowProperties.getXSize()

@@ -42,7 +42,14 @@ class ChatManager(DirectObject.DirectObject):
     def __init__(self, cr, localAvatar):
         self.cr = cr
         self.localAvatar = localAvatar
-        self.wantBackgroundFocus = 1
+        # Typing used to open the chat box on any key.  With a chat key set
+        # (space by default) only that key opens it, which leaves the
+        # letter keys free for movement.  'chat-key none' restores the old
+        # behaviour.
+        self.chatKey = ConfigVariableString('chat-key', 'space').value
+        if self.chatKey in ('', 'none'):
+            self.chatKey = None
+        self.wantBackgroundFocus = 0 if self.chatKey else 1
         self.__scObscured = 0
         self.__normalObscured = 0
         self.openChatWarning = None
@@ -216,6 +223,18 @@ class ChatManager(DirectObject.DirectObject):
             if self.wantBackgroundFocus:
                 self.chatInputNormal.chatEntry['backgroundFocus'] = 1
             self.acceptOnce('enterNormalChat', self.fsm.request, ['normalChat'])
+            if self.chatKey:
+                self.accept(self.chatKey, self.__chatKeyPressed)
+
+    def __chatKeyPressed(self):
+        # Wait a frame so the key press itself is not typed into the box.
+        taskMgr.doMethodLater(0.01, self.__openChatFromKey, 'chatKeyOpen')
+
+    def __openChatFromKey(self, task):
+        if self.fsm.getCurrentState().getName() == 'mainMenu':
+            messenger.send('wakeup')
+            messenger.send('enterNormalChat')
+        return task.done
 
     def checkObscurred(self):
         if not self.__scObscured:
@@ -227,6 +246,9 @@ class ChatManager(DirectObject.DirectObject):
         self.scButton.hide()
         self.normalButton.hide()
         self.ignore('enterNormalChat')
+        if self.chatKey:
+            self.ignore(self.chatKey)
+            taskMgr.remove('chatKeyOpen')
         if self.wantBackgroundFocus:
             self.chatInputNormal.chatEntry['backgroundFocus'] = 0
 
