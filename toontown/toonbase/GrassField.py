@@ -59,8 +59,10 @@ KEEP_FRACTION = 1.0 / 3.0
 BLOCK_SIZE = 24.0
 LOD_SWITCH = FADE_MID + BLOCK_SIZE * 0.75
 VIEW_DISTANCE = FADE_FAR       # blades are gone by here
+# Grass climbs slopes up to about 60 degrees; steeper is a bank or a wall.
+MIN_UP = 0.5
 MAX_BUMP = 0.2                 # how far ground may stray from a tile's plane
-MAX_TILES = 12000
+MAX_TILES = 24000
 MAX_LAWN = 800.0       # feet across; anything wider is not planted
 # Milliseconds a frame may spend planting grass; 0 plants it all at once.
 PLANT_BUDGET = ConfigVariableDouble('grass-plant-ms', 5.0).value
@@ -486,7 +488,7 @@ class GrassField:
         this point?  Looks at every other visible, roughly level surface
         that overlaps the lawn."""
         render = self.base.render
-        bounds = ground.getTightBounds(render)
+        bounds = ground.getPythonTag('lawn-bounds') or ground.getTightBounds(render)
         if not bounds:
             return lambda x, y, z: False
         gmin, gmax = bounds
@@ -499,7 +501,9 @@ class GrassField:
                 continue
             if any(isinstance(a.node(), Character) for a in np.getAncestors()):
                 continue          # toons and other things that move
-            tb = np.getTightBounds(render)
+            # A planted lawn's own extent was noted before its grass went
+            # in; measuring it again would walk every tile.
+            tb = np.getPythonTag('lawn-bounds') or np.getTightBounds(render)
             if not tb:
                 continue
             mn, mx = tb
@@ -658,7 +662,7 @@ class GrassField:
                     continue
                 if n[2] < 0:
                     n = -n
-                if n[2] < 0.8:
+                if n[2] < MIN_UP:
                     continue
                 det = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
                 if abs(det) < 1e-9:
@@ -683,6 +687,8 @@ class GrassField:
 
         # The grass lives under the ground it grows on, so it is hidden and
         # removed with it, but is laid out in world space.
+        if not np.hasPythonTag('lawn-bounds'):
+            np.setPythonTag('lawn-bounds', np.getTightBounds(render))
         holder = np.attachNewNode('postfx-grass')
         holder.setTransform(render, TransformState.makeIdentity())
         holder.setTag('postfx-grass', '1')

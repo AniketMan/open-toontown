@@ -1,5 +1,5 @@
 from panda3d.core import ConfigVariableBool
-from panda3d.core import NodePath, Point3, VBase3, Vec3
+from panda3d.core import BitMask32, NodePath, Point3, VBase3, Vec3
 from panda3d.otp import Nametag, NametagGroup
 
 from direct.directnotify.DirectNotifyGlobal import directNotify
@@ -35,10 +35,20 @@ from toontown.toonbase import TTLocalizer
 from toontown.toonbase.ToonBaseGlobal import base
 from toontown.toontowngui import TTDialog
 from toontown.toontowngui.TeaserPanel import TeaserPanel
+from toontown.toonbase import FrameHold
 
 
-# Walk through doors with a quick cut instead of the iris wipe.
+# Walk through doors without the iris wipe: the picture of the toon in the
+# doorway is held while the street is swapped for the room (or the room for
+# the street), the toon arrives in the pose it left in, and the held
+# picture dissolves into the new place.  See FrameHold.
 QuickDoors = ConfigVariableBool('want-quick-doors', True).value
+# How far through the doorway the toon is when the places are swapped,
+# and how far behind it the camera sits.
+DoorSwapDepth = 2.0
+DoorCamBack = 8.0
+# The main camera and the effects' surface pass; shadows are left alone.
+ViewCameras = BitMask32.bit(0) | BitMask32.bit(7)
 
 class DistributedDoor(DistributedObject, DelayDeletable):
     notify = directNotify.newCategory('DistributedDoor')
@@ -253,8 +263,87 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         return self.building
 
     def readyToExit(self):
-        base.transitions.fadeScreen(1.0)
+        if QuickDoors:
+            self.arriveThroughDoor()
+        else:
+            base.transitions.fadeScreen(1.0)
         self.sendUpdate('requestExit')
+
+    def arriveThroughDoor(self):
+        """The new place is up and this is the door the local toon comes
+        out of.  Rather than wait behind a black screen for the server to
+        open the door, put the toon and camera where they were on the
+        other side of it, already through the open door and walking, and
+        dissolve the held picture of the old place into this."""
+        avatar = base.localAvatar
+        otherNP = self.getDoorNodePath()
+        if otherNP is None or otherNP.isEmpty():
+            base.transitions.noTransitions()
+            FrameHold.release(0.3)
+            return
+        if hasattr(avatar, 'stopSmooth'):
+            avatar.stopSmooth()
+        avatar.setPosHpr(otherNP, -self.doorX, -DoorSwapDepth, ToontownGlobals.FloorOffset, 180, 0, 0)
+        avatar.setParent(ToontownGlobals.SPRender)
+        avatar.setAnimState('walk')
+        base.camera.setPosHpr(otherNP, -self.doorX, DoorCamBack - DoorSwapDepth, avatar.getHeight(), 180, 0, 0)
+        self.poseExitDoorOpen()
+        self.hideBuildingShell()
+        # Keep strolling in until the server lets the toon go.
+        self.finishArrivalStroll()
+        strollTo = base.render.getRelativePoint(otherNP, Point3(-self.doorX, -DoorSwapDepth - 3.0, ToontownGlobals.FloorOffset))
+        self.arrivalStroll = LerpPosInterval(nodePath=avatar, duration=1.5, pos=strollTo, name='doorArrivalStroll-%d' % self.doId)
+        self.arrivalStroll.start()
+        self.arrivedEarly = True
+        base.transitions.noTransitions()
+        FrameHold.release(0.3)
+
+    def hideBuildingShell(self):
+        """Coming out onto the street the camera starts inside the
+        building, behind the toon, where the insides of its walls fill
+        the view.  The building is left undrawn (it still casts its
+        shadow) until the camera is back outside."""
+        if self.doorType not in (DoorTypes.EXT_STANDARD, DoorTypes.EXT_HQ, DoorTypes.EXT_ANIM_STANDARD):
+            return
+        self.showBuildingShell()
+        building = self.getBuilding()
+        if building is None or building.isEmpty():
+            return
+        building.hide(ViewCameras)
+        self.hiddenShell = building
+
+    def showBuildingShell(self, task=None):
+        taskMgr.remove(self.uniqueName('showBuildingShell'))
+        shell = getattr(self, 'hiddenShell', None)
+        self.hiddenShell = None
+        if shell is not None and not shell.isEmpty():
+            shell.show(ViewCameras)
+
+    def showBuildingShellSoon(self):
+        if getattr(self, 'hiddenShell', None) is not None:
+            taskMgr.doMethodLater(0.6, self.showBuildingShell, self.uniqueName('showBuildingShell'))
+
+    def poseExitDoorOpen(self):
+        """Shows the leaf the local toon comes out through standing open.
+        The black panels that stand in for the dark inside of a doorway
+        stay hidden: the camera arrives behind this door, looking through
+        it at the toon, and they would black out the view."""
+        leftDoor = self.findDoorNode('leftDoor', True)
+        if leftDoor is None or leftDoor.isEmpty():
+            return False
+        for name in ('doorFrameHoleLeft', 'doorFrameHoleRight'):
+            hole = self.findDoorNode(name, True)
+            if hole is not None and not hole.isEmpty():
+                hole.hide()
+        leftDoor.show()
+        leftDoor.setHpr(self.getDoorNodePath(), -100 if self.leftSwing else 100, 0, 0)
+        return True
+
+    def finishArrivalStroll(self):
+        stroll = getattr(self, 'arrivalStroll', None)
+        if stroll is not None:
+            stroll.pause()
+            self.arrivalStroll = None
 
     def avatarEnterDoorTrack(self, avatar, duration):
         trackName = 'avatarEnterDoor-%d-%d' % (self.doId, avatar.doId)
@@ -271,9 +360,9 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         track.append(moveHere)
         if avatar.doId == base.localAvatar.doId:
             if QuickDoors:
-                # Walk straight through: no iris, just a brief dip to hide
-                # the moment the street is swapped for the room.
-                track.append(Sequence(Wait(duration * 0.8), Func(base.transitions.fadeOut, duration * 0.2), Wait(duration * 0.2), Func(avatar.b_setParent, ToontownGlobals.SPHidden)))
+                # Walk straight through.  The last frame of the toon in
+                # the doorway stays up while the places are swapped.
+                track.append(Sequence(Wait(duration), Func(FrameHold.hold), Func(avatar.b_setParent, ToontownGlobals.SPHidden)))
             else:
                 track.append(Sequence(Wait(duration * 0.5), Func(base.transitions.irisOut, duration * 0.5), Wait(duration * 0.5), Func(avatar.b_setParent, ToontownGlobals.SPHidden)))
 
@@ -455,10 +544,29 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         trackName = 'avatarExitDoor-%d-%d' % (self.doId, avatar.doId)
         track = Sequence(name=trackName)
         track.append(self.getAnimStateInterval(avatar, 'walk'))
-        track.append(PosHprInterval(avatar, Point3(-self.doorX, 0, ToontownGlobals.FloorOffset), VBase3(179, 0, 0), other=otherNP))
+        quick = QuickDoors and avatar.doId == base.localAvatar.doId
+        if quick and getattr(self, 'arrivedEarly', False):
+            # Already through the door and walking (arriveThroughDoor):
+            # just carry on to where the toon is let go.
+            self.arrivedEarly = False
+            finalPos = base.render.getRelativePoint(otherNP, Point3(-self.doorX, -6, ToontownGlobals.FloorOffset))
+            track.append(Func(self.finishArrivalStroll))
+            track.append(LerpPosInterval(nodePath=avatar, duration=0.4, pos=finalPos, blendType='easeOut'))
+            track.append(Func(self.exitCompleted))
+            track.append(Func(self.showBuildingShellSoon))
+            if hasattr(avatar, 'startSmooth'):
+                track.append(Func(avatar.startSmooth))
+            track.delayDelete = DelayDelete(avatar, 'DistributedDoor.avatarExitTrack')
+            return track
+        # The toon went into the other side of this door facing in and
+        # DoorSwapDepth through it, with the camera DoorCamBack behind.
+        # It comes out of this side in the same place, so the held picture
+        # and the live one line up.
+        startY = -DoorSwapDepth if quick else 0
+        track.append(PosHprInterval(avatar, Point3(-self.doorX, startY, ToontownGlobals.FloorOffset), VBase3(180 if quick else 179, 0, 0), other=otherNP))
         track.append(Func(avatar.setParent, ToontownGlobals.SPRender))
         if avatar.doId == base.localAvatar.doId:
-            track.append(PosHprInterval(base.camera, VBase3(-self.doorX, 5, avatar.getHeight()), VBase3(180, 0, 0), other=otherNP))
+            track.append(PosHprInterval(base.camera, VBase3(-self.doorX, startY + DoorCamBack if quick else 5, avatar.getHeight()), VBase3(180, 0, 0), other=otherNP))
 
         if avatar.doId == base.localAvatar.doId:
             finalPos = base.render.getRelativePoint(otherNP, Point3(-self.doorX, -6, ToontownGlobals.FloorOffset))
@@ -466,10 +574,12 @@ class DistributedDoor(DistributedObject, DelayDeletable):
             finalPos = base.render.getRelativePoint(otherNP, Point3(-self.doorX, -3, ToontownGlobals.FloorOffset))
 
         if QuickDoors and avatar.doId == base.localAvatar.doId:
-            # Show the room at once and step in quickly, rather than
-            # walking in behind a black screen and opening an iris after.
-            track.append(Func(base.transitions.fadeIn, 0.2))
-            track.append(LerpPosInterval(nodePath=avatar, duration=min(duration, 0.45), pos=finalPos, blendType='easeOut'))
+            # The new place is up: clear the black screen the place change
+            # put behind the held picture, dissolve the picture into it,
+            # and keep walking.
+            track.append(Func(base.transitions.noTransitions))
+            track.append(Func(FrameHold.release, 0.3))
+            track.append(LerpPosInterval(nodePath=avatar, duration=min(duration, 0.6), pos=finalPos, blendType='easeOut'))
             track.append(Func(self.exitCompleted))
         else:
             track.append(LerpPosInterval(nodePath=avatar, duration=duration, pos=finalPos, blendType='easeInOut'))
@@ -513,6 +623,8 @@ class DistributedDoor(DistributedObject, DelayDeletable):
 
     def finishAllTracks(self):
         self.finishDoorTrack()
+        self.finishArrivalStroll()
+        self.showBuildingShell()
         self.finishDoorExitTrack()
         for t in self.avatarTracks:
             t.finish()
@@ -668,6 +780,12 @@ class DistributedDoor(DistributedObject, DelayDeletable):
             h = -100
         else:
             h = 100
+
+        if getattr(self, 'arrivedEarly', False) and self.poseExitDoorOpen():
+            # The local toon is already walking out of this door, which
+            # was shown open for it; don't swing it open again.
+            self.finishDoorExitTrack()
+            return
 
         if not leftDoor.isEmpty():
             otherNP = self.getDoorNodePath()

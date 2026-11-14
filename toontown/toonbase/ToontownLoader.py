@@ -28,6 +28,9 @@ class ToontownLoader(Loader.Loader):
         self.inBulkBlock = 1
         self._lastTickT = globalClock.getRealTime()
         self.blockName = name
+        # A real loading screen takes over from a frame held for a door.
+        from toontown.toonbase import FrameHold
+        FrameHold.release(0)
         self.loadingScreen.begin(range, label, gui, tipCategory)
         return None
 
