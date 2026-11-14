@@ -23,7 +23,7 @@ import math
 import random
 import re
 
-from panda3d.core import (BitMask32, CollisionHandlerQueue, CollisionNode,
+from panda3d.core import (GeomVertexReader, BitMask32, CollisionHandlerQueue, CollisionNode,
                           CollisionRay, CollisionTraverser, ColorAttrib,
                           ConfigVariableBool, ConfigVariableInt,
                           FrameBufferProperties, GeomNode, GraphicsOutput,
@@ -177,12 +177,29 @@ class ToonWater:
             return False
         state = np.getNetState().compose(np.node().getGeomState(0))
         transparency = state.getAttrib(TransparencyAttrib)
+        named = bool(WATER_NAME.search(np.getName()) or
+                     any(WATER_NAME.search(t.getName()) for t in np.findAllTextures()))
         if transparency is None or transparency.getMode() == TransparencyAttrib.MNone:
-            return False
-        if not WATER_NAME.search(np.getName()):
+            # Solid water (a harbour painted as one opaque sheet) has to
+            # say so in its own or its texture's name.
+            if not named:
+                return False
+        elif not named:
             colour = state.getAttrib(ColorAttrib)
             if not (colour is not None and colour.getColorType() == ColorAttrib.TFlat
                     and colour.getColor()[3] < 0.95):
+                return False
+        # The underside of the water, drawn for swimmers looking up, faces
+        # down and is never seen from the shore.
+        if not self._facesUp(np):
+            return False
+        # The second of two stacked sheets: one surface is enough.
+        for other in self.base.render.findAllMatches('**/=postfx-water'):
+            ob = other.getTightBounds(self.base.render)
+            if (ob and abs(ob[1][2] - mx[2]) < 0.05 and ob[0][0] < mx[0] and ob[1][0] > mn[0]
+                    and ob[0][1] < mx[1] and ob[1][1] > mn[1]):
+                np.setTag('postfx-not-water', '1')
+                np.hide()
                 return False
         # Is there water under it?  Sound the depth on a coarse grid.
         depths = self._soundings(np, mn, mx, mx[2], grid=4.0)
@@ -201,6 +218,21 @@ class ToonWater:
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _facesUp(np):
+        geom = np.node().getGeom(0).decompose()
+        reader = GeomVertexReader(geom.getVertexData(), 'vertex')
+        mat = np.getNetTransform().getMat()
+        for prim in geom.getPrimitives():
+            if prim.getNumPrimitives() == 0 or prim.getNumVerticesPerPrimitive() != 3:
+                continue
+            pts = []
+            for vi in range(prim.getPrimitiveStart(0), prim.getPrimitiveEnd(0)):
+                reader.setRow(prim.getVertex(vi))
+                pts.append(mat.xformPoint(reader.getData3()))
+            return (pts[1] - pts[0]).cross(pts[2] - pts[0])[2] > 0
+        return True
+
     def apply(self, np):
         base = self.base
         render = base.render
@@ -212,6 +244,12 @@ class ToonWater:
         opacity = 0.7
         if colour is not None and colour.getColorType() == ColorAttrib.TFlat:
             opacity = colour.getColor()[3]
+        transparency = state.getAttrib(TransparencyAttrib)
+        if transparency is None or transparency.getMode() == TransparencyAttrib.MNone:
+            # Water painted as a solid sheet: keep the deeps nearly solid,
+            # but let the shallows show the bed like the ponds do.
+            opacity = 0.85
+            np.setTransparency(TransparencyAttrib.MAlpha)
 
         depthMap = self._measureDepth(np, mn, mx, level)
         np.setShader(self.shader, 20)
@@ -292,6 +330,11 @@ class ToonWater:
             origin = entry.getFrom().getOrigin()
             key = (int(round((origin[0] - mn[0]) / grid)), int(round((origin[1] - mn[1]) / grid)))
             d = level - entry.getSurfacePoint(render)[2]
+            # Water is often two sheets at the same height, scrolling over
+            # each other; the second one is not the bed.
+            if abs(d) < 0.03 and (WATER_NAME.search(into.getName()) or
+                                  any(WATER_NAME.search(t.getName()) for t in into.findAllTextures())):
+                continue
             if key not in depths or d < depths[key]:
                 depths[key] = d
         raysNp.removeNode()

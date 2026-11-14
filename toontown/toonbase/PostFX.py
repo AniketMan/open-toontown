@@ -35,7 +35,8 @@ from panda3d.core import (ConfigVariableBool, ConfigVariableString, Shader,
                           AlphaTestAttrib, TransparencyAttrib, RenderAttrib,
                           DepthWriteAttrib, NodePath, LMatrix4,
                           ShaderAttrib, TextureAttrib, GeomNode, Character,
-                          GeomVertexReader, GeomVertexWriter, GeomVertexData,
+                          GeomVertexReader, GeomVertexWriter, GeomVertexData, LColor,
+                          PTA_LVecBase4f, LVecBase4f,
                           InternalName, Geom, BitMask32)
 import re
 
@@ -43,6 +44,7 @@ BLOB_SHADOW = re.compile(r'drop.?shadow', re.I)
 MATERIAL_CAMERA_BITMASK = BitMask32.bit(7)
 from otp.otpbase import OTPRender
 from toontown.toonbase import MaterialLibrary
+from toontown.toonbase import GrassField as GrassFieldModule
 from toontown.toonbase.GrassField import GrassField
 from toontown.toonbase.ToonWater import ToonWater
 from direct.directnotify import DirectNotifyGlobal
@@ -256,9 +258,12 @@ void main() {
     // How much the material detail alone turns the surface toward the
     // light.  Kept apart from the smoothing, which must not be "embossed".
     float relief = dot(normalize(N + smoothTilt + detail) - normalize(N + smoothTilt), lightDirWorld);
-    // Tilt relative to the flat normal, in the composite's view space.
-    vec3 d = (worldToView * vec4(bumped - N, 0.0)).xyz;
-    // rgb: tilt of the shading normal.  alpha: relief, with 0 meaning "no data".
+    // The shading normal itself, in the composite's view space.  (Storing
+    // only its tilt from the flat normal made the composite rebuild that
+    // flat normal from depth, which goes wrong along every polygon edge
+    // and drew the mesh onto rounded characters as thin lines.)
+    vec3 d = normalize((worldToView * vec4(bumped, 0.0)).xyz);
+    // rgb: shading normal.  alpha: relief, with 0 meaning "no data".
     gl_FragColor = vec4(clamp(d * 0.5 + 0.5, 0.0, 1.0),
                         0.1 + 0.9 * clamp(relief * 0.5 + 0.5, 0.0, 1.0));
 }
@@ -276,6 +281,14 @@ uniform vec4 mix4;          // ao on, grade on, debug view (1 ao, 2 sun), unused
 uniform mat4 shadowMat;     // Panda camera space -> shadow clip space
 uniform vec3 sunDirView;    // direction to the sun in (right, up, depth) space
 uniform vec4 shadowParams;  // strength, shadow texel (uv), max distance, form strength
+uniform vec4 hazeColor;     // colour of the air, strongest amount (0 = off)
+uniform vec4 hazeParams;    // density per foot, clear distance, glow toward the sun, unused
+uniform vec3 hazeUp;        // world up in (right, up, depth) space
+uniform vec4 lightKey;      // colour and strength of the sun, moon or lamp
+uniform vec4 lightAmbient;  // colour and strength of the fill light; a = 1 when the scene is lit
+uniform vec4 lampPos[8];    // room lights in (right, up, depth) view space, reach in feet
+uniform vec4 lampCol[8];    // their colour and strength; a = 1 when in use
+uniform vec4 indoor;        // 1 under a roof, warmth of the room light, camera height above the floor, falloff
 """ + DEPTH_LIB + """
 float ign(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
@@ -333,11 +346,15 @@ void main() {
     float sun = 1.0;
     vec3 P = viewPos(uv);
     vec4 mat = texture2D(materialTex, uv);
+    vec3 N = vec3(0.0, 0.0, -1.0);
     if (shadowParams.x > 0.0 && P.z < lensInfo.y * 0.97) {
         float ndl;
-        vec3 N = viewNormal(P, ndl);
+        N = viewNormal(P, ndl);
         // The material pass knows the smooth / normal-mapped normal.
-        if (mat.a > 0.05) ndl += dot(mat.rgb * 2.0 - 1.0, sunDirView);
+        if (mat.a > 0.05) {
+            N = normalize(mat.rgb * 2.0 - 1.0);
+            ndl = dot(N, sunDirView);
+        }
         sun = sunLight(P, N, ndl);
     }
     // Surface relief from the material pass: where the normal map tilts
@@ -348,11 +365,70 @@ void main() {
         relief *= 1.0 - smoothstep(60.0, 140.0, P.z);     // too fine to see far away
         relief *= 0.45 + 0.55 * sun;                      // weaker in shadow
     }
-    // Shade is tinted cool rather than black: it reads as sky-lit shadow
-    // on flat-coloured cartoon surfaces instead of dirt.
-    c *= mix(vec3(0.42, 0.40, 0.55), vec3(1.0), ao);
-    c *= mix(vec3(0.56, 0.58, 0.78), vec3(1.0), 1.0 - shadowParams.x * (1.0 - sun));
+    // The game's art is painted at full brightness.  Here it is treated
+    // as the colour of each surface and lit: a dim ambient fill from the
+    // sky or the room, plus a key light (sun, moon or lamp) only where
+    // that light actually reaches.  Take the key away and the scene is
+    // left in its ambient shade.
+    float direct = 1.0 - shadowParams.x * (1.0 - sun);
+    if (lightAmbient.a > 0.5 && P.z < lensInfo.y * 0.97) {
+        vec3 key = lightKey.rgb;
+        if (indoor.x > 0.5) {
+            // The room's own lights: a ceiling fitting, each lamp that
+            // stands in it and each window.  Every one lights what faces
+            // it and is near it, and fades with distance.
+            // Rounded characters carry a smooth normal in the material
+            // pass; without it their flat polygons would show as facets.
+            vec3 Ns = mat.a > 0.05 ? normalize(mat.rgb * 2.0 - 1.0) : N;
+            vec3 sum = vec3(0.0);
+            for (int i = 0; i < 8; i++) {
+                if (lampCol[i].a < 0.5) continue;
+                vec3 toLamp = lampPos[i].xyz - P;
+                float d = length(toLamp);
+                // Light wraps a little past the edge, as it does off pale
+                // walls, so nothing turned from a lamp goes fully black.
+                float facing = 0.22 + 0.78 * smoothstep(-0.55, 0.60, dot(Ns, toLamp / d));
+                float reach = lampPos[i].w;
+                float amount = facing / (1.0 + d * d / (reach * reach));
+                // Only the ceiling fitting casts the mapped shadows.
+                if (i == 0) amount *= direct;
+                sum += lampCol[i].rgb * amount;
+            }
+            key *= sum;
+            direct = 1.0;
+        }
+        // Creases and corners see less of the sky, and a little less of
+        // the key light too.
+        vec3 ambient = lightAmbient.rgb * mix(vec3(0.62, 0.60, 0.70), vec3(1.0), ao);
+        vec3 light = ambient + key * direct * mix(0.80, 1.0, ao);
+        // Where several lights overlap, roll off instead of burning out.
+        light = min(light, vec3(1.0) + (light - vec3(1.0)) * 0.22);
+        // Far backdrops are paintings of scenery with see-through sky
+        // above it.  Lighting fades off up their height so the top of a
+        // painting never shows as an edge against the real sky.
+        float backdrop = smoothstep(250.0, 500.0, length(P)) *
+                         smoothstep(0.02, 0.20, dot(normalize(P), hazeUp));
+        c *= mix(light, vec3(1.0), backdrop);
+    } else {
+        // Menus and the sky itself stay as painted.
+        c *= mix(vec3(0.42, 0.40, 0.55), vec3(1.0), ao);
+    }
     c *= 1.0 + clamp(relief, -0.6, 0.6);
+    c = clamp(c, 0.0, 1.0);
+    // Aerial perspective: distant scenery drifts toward the colour of
+    // the air, losing contrast the way real landscapes do.  The sky gets
+    // the same haze along the horizon, so scenery standing against it
+    // (and the see-through parts of painted backdrops) never shows an
+    // edge, and it thins with height into clear sky.
+    if (hazeColor.a > 0.0) {
+        vec3 V = normalize(P);
+        float isSky = step(lensInfo.y * 0.97, P.z);
+        float dist = max(length(P) - hazeParams.y, 0.0);
+        float haze = mix(1.0 - exp(-dist * hazeParams.x), 1.0, isSky) * hazeColor.a;
+        haze *= 1.0 - smoothstep(0.02, 0.20, dot(V, hazeUp));
+        float toward = max(dot(V, sunDirView), 0.0);
+        c = mix(c, hazeColor.rgb * (1.0 + hazeParams.z * toward * toward), haze);
+    }
     if (mix4.y > 0.5) {
         float l = dot(c, vec3(0.299, 0.587, 0.114));
         c = mix(vec3(l), c, 1.10);                       // saturation
@@ -405,8 +481,40 @@ class PostFX(DirectObject):
     AO_MAX_DIST = 220.0
     SUN_DIRECTION = Vec3(0.45, 0.55, -0.70)   # direction the sunlight travels
     SHADOW_EXTENT = 160.0  # width of the area around the player that gets shadows
-    SHADOW_STRENGTH = 0.85
-    FORM_STRENGTH = 0.55   # shading of surfaces facing away from the sun
+    SHADOW_STRENGTH = 0.96 # how completely a cast shadow blocks the key light
+    # Light levels.  Ambient + key is a little over 1, so a surface in
+    # full light looks as the artists painted it; in shade only the
+    # ambient part is left.
+    SUN_COLOR = Vec3(0.76, 0.69, 0.55)
+    SKY_AMBIENT = 0.42         # daylight fill, tinted by the sky
+    MOON_COLOR = Vec3(0.30, 0.34, 0.46)
+    NIGHT_AMBIENT = 0.42
+    LAMP_COLOR = Vec3(0.86, 0.77, 0.60)
+    ROOM_AMBIENT = Vec3(0.19, 0.175, 0.21)
+    # Under a roof the light comes from the ceiling instead: almost
+    # straight down, softer and weaker than the sun, and warm.
+    INDOOR_LIGHT_DIRECTION = Vec3(0.20, 0.30, -0.93)
+    INDOOR_SHADOW_STRENGTH = 0.85
+    INDOOR_SHADOW_SOFTNESS = 2.4   # times the sun's shadow blur
+    INDOOR_FORM_STRENGTH = 0.0     # the lamp does its own facing
+    CEILING_STRENGTH = 1.95        # brightness right under a ceiling fitting
+    LAMP_STRENGTH = 1.6            # a standing lamp, close to its shade
+    LAMP_TINT = Vec3(1.0, 0.86, 0.62)
+    WINDOW_STRENGTH = 0.7          # daylight through one window
+    WINDOW_TINT = Vec3(0.80, 0.95, 1.20)
+    LAMP_GAIN = 1.75               # brightness right under the lamp
+    LAMP_MAX_ROOM = 140.0          # bigger spaces get a lamp that follows the toon
+    INDOOR_WARMTH = 1.0
+    INDOOR_FALLOFF = 0.45          # how much darker the tops of the walls are than the floor
+    FORM_STRENGTH = 0.80   # shading of surfaces facing away from the sun
+    # The haze begins where the grass blades begin to thin and is half
+    # way to its full strength where the last of them are gone, so the
+    # two fades read as one.
+    HAZE_START = GrassFieldModule.FADE_NEAR
+    HAZE_DENSITY = 0.693 / (GrassFieldModule.FADE_FAR - GrassFieldModule.FADE_NEAR)
+    HAZE_MAX = 0.52        # the most a far object can fade
+    HAZE_SUN_GLOW = 0.12   # extra brightness of the air when looking toward the sun
+    HAZE_DAY_COLOR = Vec3(0.74, 0.84, 0.96)   # used when the sky gives no colour
     RELIEF_STRENGTH = 0.9  # how strongly material normal maps shade a surface
     SHAPE_STRENGTH = 3.0   # depth of shapes painted into a texture (grout, plank gaps)
     GAP_SENSITIVITY = 6.0  # how readily a dark line counts as a gap with no grain
@@ -433,6 +541,10 @@ class PostFX(DirectObject):
         self.wantMaterials = ConfigVariableBool('postfx-materials', True).value
         self.wantSmooth = ConfigVariableBool('postfx-smooth-characters', True).value
         self.wantGrass = ConfigVariableBool('postfx-grass', True).value
+        self.wantIndoorLight = ConfigVariableBool('postfx-indoor-light', True).value
+        self.indoorOn = False
+        self.wantHaze = ConfigVariableBool('postfx-haze', True).value
+        self._hazeSky = (None, None)
         self.grass = None
         self.water = None
         self.wantWater = ConfigVariableBool('postfx-water', True).value
@@ -447,6 +559,11 @@ class PostFX(DirectObject):
         # outlive it, the engine crashes drawing the next frame, so tear
         # everything down the moment the window closes.
         self.accept('window-event', self._windowEvent)
+        # Switches the sun, moon or lamp off, leaving only the ambient fill.
+        self.lightsOff = False
+        lightsKey = ConfigVariableString('postfx-lights-hotkey', 'f4').value
+        if lightsKey:
+            self.accept(lightsKey, self.toggleLights)
         compareKey = ConfigVariableString('postfx-compare-hotkey', 'f5').value
         if compareKey:
             self.accept(compareKey, self.saveComparison)
@@ -475,6 +592,10 @@ class PostFX(DirectObject):
             self.disable()
         else:
             self.enable()
+
+    def toggleLights(self):
+        self.lightsOff = not self.lightsOff
+        self.notify.info('Key light %s.' % ('off' if self.lightsOff else 'on'))
 
     def saveComparison(self):
         """Saves the current view twice, effects off and on, into
@@ -595,7 +716,18 @@ class PostFX(DirectObject):
         quad.setShaderInput('shadowMat', LMatrix4.identMat())
         quad.setShaderInput('sunDirView', Vec3(0, 1, 0))
         quad.setShaderInput('shadowParams', Vec4(0, 0, 0, 0))
+        quad.setShaderInput('hazeColor', Vec4(0, 0, 0, 0))
+        quad.setShaderInput('hazeParams', Vec4(0, 0, 0, 0))
+        quad.setShaderInput('hazeUp', Vec3(0, 1, 0))
+        quad.setShaderInput('indoor', Vec4(0, 0, 0, 0))
+        self._lampPos = PTA_LVecBase4f.emptyArray(8)
+        self._lampCol = PTA_LVecBase4f.emptyArray(8)
+        quad.setShaderInput('lampPos', self._lampPos)
+        quad.setShaderInput('lampCol', self._lampCol)
+        quad.setShaderInput('lightKey', Vec4(0, 0, 0, 0))
+        quad.setShaderInput('lightAmbient', Vec4(1, 1, 1, 0))
         self.sunOn = False
+        self.indoorOn = False
         if not self.wantShadows:
             return
         size = self.shadowSize
@@ -884,7 +1016,7 @@ class PostFX(DirectObject):
 
     def _updateBlobShadows(self):
         """Hides the game's round drop shadows while real ones are cast."""
-        hide = self.sunOn
+        hide = self.sunOn or self.indoorOn
         render = self.base.render
         off = ColorWriteAttrib.make(ColorWriteAttrib.COff)
         keep = []
@@ -940,22 +1072,187 @@ class PostFX(DirectObject):
         names = [c.__name__ for c in type(place).__mro__]
         return any(n in names for n in self.OUTDOOR_PLACES)
 
+    LAMP_NAMES = re.compile(r'lamp_?shade|lantern|chandelier|light_?bulb', re.I)
+    WINDOW_NAMES = re.compile(r'window', re.I)
+
+    def _roomLights(self):
+        """The lights of the room the toon is in, as (world position,
+        colour and strength, reach in feet).  The first is always the
+        ceiling fitting.  The rest are read off the room itself: one for
+        every lamp standing in it and one for every window.  Looked at
+        again every couple of seconds because rooms finish loading late."""
+        now = globalClock.getRealTime()
+        cached = getattr(self, '_lamp', None)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        base = self.base
+        render = base.render
+        avatar = getattr(base, 'localAvatar', None)
+        if avatar is not None and not avatar.isEmpty():
+            feet = avatar.getPos(render)
+        else:
+            feet = base.cam.getPos(render) - Vec3(0, 0, 5)
+        rooms = []
+        lo, hi = None, None
+        for child in render.getChildren():
+            # Rooms are plain model nodes; skip toons, the camera and helpers.
+            if child.isHidden() or child.isStashed() or self._isCharacter(child):
+                continue
+            if child.find('**/+GeomNode').isEmpty() or not child.find('**/+Camera').isEmpty():
+                continue
+            if not child.find('**/+Character').isEmpty():
+                continue
+            bounds = child.getTightBounds()
+            if not bounds:
+                continue
+            rooms.append(child)
+            if lo is None:
+                lo, hi = Point3(bounds[0]), Point3(bounds[1])
+            else:
+                lo = Point3(min(lo[0], bounds[0][0]), min(lo[1], bounds[0][1]), min(lo[2], bounds[0][2]))
+                hi = Point3(max(hi[0], bounds[1][0]), max(hi[1], bounds[1][1]), max(hi[2], bounds[1][2]))
+        lights = []
+        size = (hi - lo) if lo is not None else Vec3(0)
+        fitted = lo is not None and max(size[0], size[1]) <= self.LAMP_MAX_ROOM and size[2] > 6.0
+        if fitted:
+            centre = Point3((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, lo[2])
+            # Standing lamps: a warm pool around each shade.
+            for room in rooms:
+                for np in room.findAllMatches('**/*'):
+                    if not self.LAMP_NAMES.search(np.getName()) or np.isHidden():
+                        continue
+                    b = np.getTightBounds(render)
+                    if b:
+                        at = Point3((b[0][0] + b[1][0]) * 0.5, (b[0][1] + b[1][1]) * 0.5, b[1][2] + 0.3)
+                        lights.append((at, self.LAMP_TINT * self.LAMP_STRENGTH, 7.5))
+            # Windows: cool daylight spilling in from each.
+            for room in rooms:
+                for np in room.findAllMatches('**/+GeomNode'):
+                    if self.WINDOW_NAMES.search(np.getName()) and not np.isHidden():
+                        for at in self._windowCentres(np, lo[2]):
+                            inward = Vec3(centre[0] - at[0], centre[1] - at[1], 0)
+                            if inward.normalize():
+                                at = at + inward * 1.5
+                            lights.append((at, self.WINDOW_TINT * self.WINDOW_STRENGTH, 9.0))
+            # Ceiling fittings: one for a small room, a row or grid for a
+            # long or large one.  Dimmer when lamps and windows share the job.
+            height = max(min(size[2] * 0.8, 22.0), 9.0)
+            nx = max(1, int(round(size[0] / 34.0)))
+            ny = max(1, int(round(size[1] / 34.0)))
+            share = self.CEILING_STRENGTH * (0.36 if lights else 1.0)
+            # Neighbouring fittings in a grid overlap; keep the total level.
+            share /= 1.0 + 0.55 * (min(nx * ny, 5) - 1) ** 0.5
+            reach = max(height, 0.45 * max(size[0] / nx, size[1] / ny))
+            ceiling = []
+            for ix in range(nx):
+                for iy in range(ny):
+                    at = Point3(lo[0] + size[0] * (ix + 0.5) / nx, lo[1] + size[1] * (iy + 0.5) / ny, lo[2] + height)
+                    ceiling.append((at, Vec3(1, 1, 1) * share, reach))
+            # The fitting nearest the toon is the one that casts shadows.
+            ceiling.sort(key=lambda l: (l[0] - feet).lengthSquared())
+            lights = ceiling + lights
+        else:
+            lights = [(Point3(feet[0], feet[1], feet[2] + 16.0), Vec3(1, 1, 1) * self.CEILING_STRENGTH, 26.0)]
+        self._lamp = (now + 2.0, lights)
+        return lights
+
+    @staticmethod
+    def _windowCentres(np, floorZ):
+        """World-space centres of the separate panes in a node that holds
+        a room's doors and windows as one mesh: groups of connected
+        polygons that start well above the floor are windows."""
+        render = np.getTop()
+        mat = np.getMat(render)
+        parent = {}
+
+        def find(k):
+            while parent[k] != k:
+                parent[k] = parent[parent[k]]
+                k = parent[k]
+            return k
+
+        points = {}
+        for geom in np.node().getGeoms():
+            geom = geom.decompose()
+            reader = GeomVertexReader(geom.getVertexData(), 'vertex')
+            for prim in geom.getPrimitives():
+                for t in range(prim.getNumPrimitives()):
+                    keys = []
+                    for vi in range(prim.getPrimitiveStart(t), prim.getPrimitiveEnd(t)):
+                        reader.setRow(prim.getVertex(vi))
+                        p = mat.xformPoint(reader.getData3())
+                        k = (round(p[0], 1), round(p[1], 1), round(p[2], 1))
+                        points[k] = p
+                        parent.setdefault(k, k)
+                        keys.append(k)
+                    for k in keys[1:]:
+                        parent[find(k)] = find(keys[0])
+        groups = {}
+        for k, p in points.items():
+            groups.setdefault(find(k), []).append(p)
+        centres = []
+        for pts in groups.values():
+            zs = [p[2] for p in pts]
+            if min(zs) - floorZ < 1.5 or max(zs) - min(zs) < 0.8 or len(pts) < 4:
+                continue
+            n = float(len(pts))
+            c = Point3(sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n, sum(zs) / n)
+            # Frame, glass and sill are separate pieces of one window.
+            if all((c - o).length() > 3.0 for o in centres):
+                centres.append(c)
+        return centres
+
+    def _hasPlace(self):
+        """True once the local toon is standing somewhere in the world."""
+        playGame = getattr(getattr(self.base, 'cr', None), 'playGame', None)
+        if playGame is None:
+            return ConfigVariableBool('postfx-indoor-everywhere', False).value
+        return playGame.getPlace() is not None
+
     def _updateShadows(self):
         if self.shadowBuffer is None:
             return
         base = self.base
         outdoors = self._isOutdoors()
-        if outdoors != self.sunOn:
+        indoors = self.wantIndoorLight and not outdoors and self._hasPlace()
+        if outdoors != self.sunOn or indoors != self.indoorOn:
+            if outdoors != self.sunOn:
+                # Grass is only grown outdoors; look at the ground again.
+                if outdoors and getattr(self, '_materialSeen', None) is not None:
+                    self._materialSeen.clear()
+                    self._materialScanAt = 0.0
             self.sunOn = outdoors
-            # Grass is only grown outdoors; look at the ground again.
-            if outdoors and getattr(self, '_materialSeen', None) is not None:
-                self._materialSeen.clear()
-                self._materialScanAt = 0.0
-            self.shadowBuffer.setActive(outdoors)
-            if not outdoors:
+            self.indoorOn = indoors
+            self.shadowBuffer.setActive(outdoors or indoors)
+            # The ceiling light looks down through the roof: rooms are
+            # modelled facing inward, so from above the ceiling and the
+            # near walls are back faces and never drawn.
+            self.sunRoot.lookAt(Point3(self.INDOOR_LIGHT_DIRECTION if indoors
+                                       else self.SUN_DIRECTION))
+            if not indoors:
+                self.compositeQuad.setShaderInput('indoor', Vec4(0, 0, 0, 0))
+            if not (outdoors or indoors):
                 self.compositeQuad.setShaderInput('shadowParams', Vec4(0, 0, 0, 0))
-        if not outdoors:
+        if not (outdoors or indoors):
             return
+        direction = self.INDOOR_LIGHT_DIRECTION if indoors else self.SUN_DIRECTION
+        if indoors:
+            lights = self._roomLights()
+            # The eight nearest the camera, always keeping the ceiling fitting first.
+            camPos = base.cam.getPos(base.render)
+            rest = sorted(lights[1:], key=lambda l: (l[0] - camPos).lengthSquared())[:7]
+            chosen = lights[:1] + rest
+            for i in range(8):
+                if i < len(chosen):
+                    pos, color, reach = chosen[i]
+                    v = base.cam.getRelativePoint(base.render, pos)
+                    self._lampPos[i] = LVecBase4f(v[0], v[2], v[1], reach)
+                    self._lampCol[i] = LVecBase4f(color[0], color[1], color[2], 1)
+                else:
+                    self._lampCol[i] = LVecBase4f(0, 0, 0, 0)
+            self.compositeQuad.setShaderInput('lampPos', self._lampPos)
+            self.compositeQuad.setShaderInput('lampCol', self._lampCol)
+            self.compositeQuad.setShaderInput('indoor', Vec4(1.0, self.INDOOR_WARMTH, 0, 1.0))
         cam = base.cam
         render = base.render
         # Centre the map a little ahead of the camera, on the ground plane.
@@ -971,14 +1268,136 @@ class PostFX(DirectObject):
                               round(local[2] / texel) * texel)
         mat = (cam.getMat(render) * render.getMat(self.shadowCam) *
                self.shadowLens.getProjectionMat())
-        toSun = cam.getRelativeVector(render, -self.SUN_DIRECTION)
+        toSun = cam.getRelativeVector(render, -direction)
         toSun.normalize()
         quad = self.compositeQuad
         quad.setShaderInput('shadowMat', mat)
         quad.setShaderInput('sunDirView', Vec3(toSun[0], toSun[2], toSun[1]))
-        quad.setShaderInput('shadowParams',
-                            Vec4(self.SHADOW_STRENGTH, 1.0 / self.shadowSize,
-                                 self.SHADOW_EXTENT * 0.55, self.FORM_STRENGTH))
+        if indoors:
+            quad.setShaderInput('shadowParams',
+                                Vec4(self.INDOOR_SHADOW_STRENGTH,
+                                     self.INDOOR_SHADOW_SOFTNESS / self.shadowSize,
+                                     self.SHADOW_EXTENT * 0.55, self.INDOOR_FORM_STRENGTH))
+        else:
+            quad.setShaderInput('shadowParams',
+                                Vec4(self.SHADOW_STRENGTH, 1.0 / self.shadowSize,
+                                     self.SHADOW_EXTENT * 0.55, self.FORM_STRENGTH))
+
+    def _skyColor(self):
+        """Colour of the current sky near the horizon, or None.  Skies
+        are painted domes, so the band of the painting just above the
+        horizon says what time of day the neighbourhood is in."""
+        hood = getattr(getattr(getattr(self.base, 'cr', None), 'playGame', None), 'hood', None)
+        sky = getattr(hood, 'sky', None)
+        if sky is None or sky.isEmpty():
+            self._hazeSky = (None, None)
+            return None
+        if self._hazeSky[0] != sky:
+            total, weight = Vec3(0), 0.0
+            for gnp in sky.findAllMatches('**/+GeomNode'):
+                node = gnp.node()
+                for i in range(node.getNumGeoms()):
+                    vdata = node.getGeom(i).getVertexData()
+                    attrib = node.getGeomState(i).getAttrib(TextureAttrib)
+                    tex = attrib.getTexture() if attrib else None
+                    if tex is None or vdata.getNumRows() != 4 or not vdata.hasColumn('texcoord'):
+                        continue
+                    peek = tex.peek()
+                    if peek is None:
+                        continue
+                    pos = GeomVertexReader(vdata, 'vertex')
+                    uv = GeomVertexReader(vdata, 'texcoord')
+                    corners = []
+                    while not pos.isAtEnd():
+                        v, t = pos.getData3(), uv.getData2()
+                        corners.append((v[2] / max(v.length(), 1e-6), Vec2(t)))
+                    corners.sort(key=lambda c: c[0])
+                    # A wall panel of the dome: bottom edge on the horizon.
+                    if corners[0][0] > 0.15 or corners[3][0] < 0.2:
+                        continue
+                    (l1, l2), (h1, h2) = [c[1] for c in corners[:2]], [c[1] for c in corners[2:]]
+                    if (h1 - l1).lengthSquared() > (h2 - l1).lengthSquared():
+                        h1, h2 = h2, h1
+                    texel = LColor()
+                    for step in range(1, 8):
+                        f = step / 8.0
+                        at = (l1 + (l2 - l1) * f) * 0.85 + (h1 + (h2 - h1) * f) * 0.15
+                        peek.lookup(texel, at[0], at[1])
+                        total += Vec3(texel[0], texel[1], texel[2]) * texel[3]
+                        weight += texel[3]
+            self._hazeSky = (sky, total / weight if weight >= 4.0 else None)
+        color = self._hazeSky[1]
+        if color is None:
+            return None
+        scale = sky.getColorScale()
+        return Vec3(color[0] * scale[0], color[1] * scale[1], color[2] * scale[2])
+
+    def _updateLight(self):
+        """Chooses the key and fill light for where the toon is."""
+        quad = self.compositeQuad
+        if self.indoorOn:
+            key, ambient = Vec3(self.LAMP_COLOR), Vec3(self.ROOM_AMBIENT)
+        elif self.sunOn:
+            sky = self._skyColor()
+            if sky is None:
+                sky = Vec3(self.HAZE_DAY_COLOR)
+            peak = max(sky[0], sky[1], sky[2], 1e-3)
+            hue = sky / peak
+            # How much daylight there is, judged from the sky's brightness:
+            # a noon sky gives full sun, a night sky leaves moonlight.
+            lum = sky[0] * 0.299 + sky[1] * 0.587 + sky[2] * 0.114
+            day = min(max((lum - 0.22) / 0.45, 0.0), 1.0)
+            day = day * day * (3.0 - 2.0 * day)
+            # Low suns take on the colour of the sky they shine through.
+            sun = Vec3(self.SUN_COLOR[0] * (0.6 + 0.4 * hue[0]),
+                       self.SUN_COLOR[1] * (0.6 + 0.4 * hue[1]),
+                       self.SUN_COLOR[2] * (0.6 + 0.4 * hue[2]))
+            key = self.MOON_COLOR * (1.0 - day) + sun * day
+            fill = hue * 0.55 + Vec3(0.45)
+            ambient = fill * (self.NIGHT_AMBIENT * (1.0 - day) + self.SKY_AMBIENT * day)
+            # Under a plain daytime sky, full light adds up to exactly
+            # white, so a sunlit surface is the colour it was painted.
+            # Coloured skies (sunset, night) keep their cast.
+            saturation = 1.0 - min(sky[0], sky[1], sky[2]) / peak
+            neutral = day * min(max(1.0 - (saturation - 0.15) / 0.5, 0.0), 1.0)
+            for i in range(3):
+                total = key[i] + ambient[i]
+                scale = (total + (1.0 - total) * neutral) / total
+                key[i] *= scale
+                ambient[i] *= scale
+        else:
+            quad.setShaderInput('lightAmbient', Vec4(1, 1, 1, 0))
+            return
+        if self.lightsOff:
+            key = Vec3(0)
+        up = self.base.cam.getRelativeVector(self.base.render, Vec3(0, 0, 1))
+        up.normalize()
+        quad.setShaderInput('hazeUp', Vec3(up[0], up[2], up[1]))
+        quad.setShaderInput('lightKey', Vec4(key[0], key[1], key[2], 1))
+        quad.setShaderInput('lightAmbient', Vec4(ambient[0], ambient[1], ambient[2], 1))
+
+    def _updateHaze(self):
+        quad = self.compositeQuad
+        render = self.base.render
+        # Only under an open sky, and not where the game already fogs
+        # the scene itself (under water, for instance).
+        if not (self.wantHaze and self.sunOn) or render.getFog() is not None:
+            quad.setShaderInput('hazeColor', Vec4(0, 0, 0, 0))
+            return
+        sky = self._skyColor()
+        color = Vec3(self.HAZE_DAY_COLOR) if sky is None else sky
+        # Air lit by the sky is a little paler than the sky behind it.
+        brightness = max(color[0], color[1], color[2])
+        color = color * 0.8 + Vec3(brightness) * 0.2
+        # Night and other whole-scene tints darken the air with everything else.
+        tint = render.getColorScale()
+        color = Vec3(color[0] * tint[0], color[1] * tint[1], color[2] * tint[2])
+        quad.setShaderInput('hazeColor', Vec4(color[0], color[1], color[2], self.HAZE_MAX))
+        up = self.base.cam.getRelativeVector(render, Vec3(0, 0, 1))
+        up.normalize()
+        quad.setShaderInput('hazeUp', Vec3(up[0], up[2], up[1]))
+        quad.setShaderInput('hazeParams', Vec4(self.HAZE_DENSITY, self.HAZE_START,
+                                               self.HAZE_SUN_GLOW, 0))
 
     def destroy(self):
         self.disable()
@@ -994,6 +1413,8 @@ class PostFX(DirectObject):
             return task.cont if task else None
         self._updateShadows()
         self._updateMaterials()
+        self._updateLight()
+        self._updateHaze()
         fov = lens.getFov()
         state = (win.getXSize(), win.getYSize(), lens.getNear(), lens.getFar(),
                  fov[0], fov[1])

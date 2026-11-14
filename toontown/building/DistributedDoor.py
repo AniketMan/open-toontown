@@ -1,3 +1,4 @@
+from panda3d.core import ConfigVariableBool
 from panda3d.core import NodePath, Point3, VBase3, Vec3
 from panda3d.otp import Nametag, NametagGroup
 
@@ -35,6 +36,9 @@ from toontown.toonbase.ToonBaseGlobal import base
 from toontown.toontowngui import TTDialog
 from toontown.toontowngui.TeaserPanel import TeaserPanel
 
+
+# Walk through doors with a quick cut instead of the iris wipe.
+QuickDoors = ConfigVariableBool('want-quick-doors', True).value
 
 class DistributedDoor(DistributedObject, DelayDeletable):
     notify = directNotify.newCategory('DistributedDoor')
@@ -266,7 +270,12 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         moveHere = Sequence(self.getAnimStateInterval(avatar, 'walk'), LerpPosInterval(nodePath=avatar, duration=duration, pos=finalPos, blendType='easeIn'))
         track.append(moveHere)
         if avatar.doId == base.localAvatar.doId:
-            track.append(Sequence(Wait(duration * 0.5), Func(base.transitions.irisOut, duration * 0.5), Wait(duration * 0.5), Func(avatar.b_setParent, ToontownGlobals.SPHidden)))
+            if QuickDoors:
+                # Walk straight through: no iris, just a brief dip to hide
+                # the moment the street is swapped for the room.
+                track.append(Sequence(Wait(duration * 0.8), Func(base.transitions.fadeOut, duration * 0.2), Wait(duration * 0.2), Func(avatar.b_setParent, ToontownGlobals.SPHidden)))
+            else:
+                track.append(Sequence(Wait(duration * 0.5), Func(base.transitions.irisOut, duration * 0.5), Wait(duration * 0.5), Func(avatar.b_setParent, ToontownGlobals.SPHidden)))
 
         track.delayDelete = DelayDelete(avatar, 'avatarEnterDoorTrack')
         return track
@@ -456,10 +465,17 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         else:
             finalPos = base.render.getRelativePoint(otherNP, Point3(-self.doorX, -3, ToontownGlobals.FloorOffset))
 
-        track.append(LerpPosInterval(nodePath=avatar, duration=duration, pos=finalPos, blendType='easeInOut'))
-        if avatar.doId == base.localAvatar.doId:
+        if QuickDoors and avatar.doId == base.localAvatar.doId:
+            # Show the room at once and step in quickly, rather than
+            # walking in behind a black screen and opening an iris after.
+            track.append(Func(base.transitions.fadeIn, 0.2))
+            track.append(LerpPosInterval(nodePath=avatar, duration=min(duration, 0.45), pos=finalPos, blendType='easeOut'))
             track.append(Func(self.exitCompleted))
-            track.append(Func(base.transitions.irisIn))
+        else:
+            track.append(LerpPosInterval(nodePath=avatar, duration=duration, pos=finalPos, blendType='easeInOut'))
+            if avatar.doId == base.localAvatar.doId:
+                track.append(Func(self.exitCompleted))
+                track.append(Func(base.transitions.irisIn))
 
         if hasattr(avatar, 'startSmooth'):
             track.append(Func(avatar.startSmooth))

@@ -26,7 +26,7 @@ import math
 import random
 import re
 
-from panda3d.core import (BitMask32, Character, BoundingBox, ColorBlendAttrib,
+from panda3d.core import (BitMask32, Character, TransparencyAttrib, Texture, ColorAttrib, ColorScaleAttrib, BoundingBox, ColorBlendAttrib,
                           CullFaceAttrib, SamplerState, Geom, GeomNode,
                           GeomTriangles, GeomVertexData, GeomVertexFormat,
                           GeomVertexReader, GeomVertexWriter, LODNode,
@@ -51,9 +51,9 @@ WIND_STRENGTH = 0.50
 #
 # A third of the blades last beyond FADE_MID.  Past LOD_SWITCH a block draws
 # only those (a lighter mesh of the very same blades, so nothing changes).
-FADE_NEAR = 32.0
-FADE_MID = 72.0
-FADE_FAR = 155.0
+FADE_NEAR = 40.0
+FADE_MID = 90.0
+FADE_FAR = 190.0
 KEEP_FRACTION = 1.0 / 3.0
 BLOCK_SIZE = 24.0
 LOD_SWITCH = FADE_MID + BLOCK_SIZE * 0.75
@@ -64,7 +64,9 @@ MAX_TILES = 12000
 # pond water, sidewalks, steps, hedges.  (Flat decals such as drop shadows,
 # which sit a hair above the ground, do not count.)
 COVER_HEIGHT = 5.0
-COVER_MIN = 0.08
+COVER_MIN = -0.02       # paving, pads and roads laid flat on the lawn count as cover
+SHADOW_NAMES = re.compile(r'shad+ow', re.I)
+WATER_NAMES = re.compile(r'water|pond|lake|river|pool', re.I)   # ...but painted shadows do not
 # The baked meadow texture (tools/bake_meadow.py) laid over the painted lawn.
 MEADOW_TEXTURE = 'materials/meadow_detail.png'
 MEADOW_REPEAT = 22.0           # feet per repeat
@@ -75,6 +77,7 @@ MEADOW_STRENGTH = 1.0
 GROUND_NAME = re.compile(r'grass|lawn|floor|ground|terrain|site_plan|field', re.I)
 # A sheet of grass texture far below some playgrounds, never seen up close.
 SKIP_NAME = re.compile(r'^base_', re.I)
+NOT_LAWN = re.compile(r'hedge|tree|leaf|leaves|bush|roof|wall|sky|shadow', re.I)
 
 VERT = """#version 120
 uniform mat4 p3d_ModelViewProjectionMatrix;
@@ -331,6 +334,28 @@ class GrassField:
             result.append(NodePath(node))
         return result
 
+    def _opacity(self, tex):
+        """Returns opacity(u, v) for a texture, or None if it is solid.
+        Many of the game's textures keep their transparency in a second,
+        grey-scale file beside the colour one."""
+        key = tex.getName()
+        cache = self.__dict__.setdefault('opacities', {})
+        if key not in cache:
+            fn = None
+            mask = PNMImage()
+            if tex.hasAlphaFullpath() and mask.read(tex.getAlphaFullpath()):
+                w, h = mask.getXSize(), mask.getYSize()
+                fn = lambda u, v, m=mask, w=w, h=h: m.getGray(min(int((u % 1.0) * w), w - 1),
+                                                              min(int((1.0 - v % 1.0) * h), h - 1))
+            else:
+                full = PNMImage()
+                if tex.hasFullpath() and full.read(tex.getFullpath()) and full.hasAlpha():
+                    w, h = full.getXSize(), full.getYSize()
+                    fn = lambda u, v, m=full, w=w, h=h: m.getAlpha(min(int((u % 1.0) * w), w - 1),
+                                                                   min(int((1.0 - v % 1.0) * h), h - 1))
+            cache[key] = fn
+        return cache[key]
+
     def _image(self, tex):
         key = tex.getName()
         if key not in self.images:
@@ -339,7 +364,7 @@ class GrassField:
             if tex.hasFullpath():
                 ok = img.read(tex.getFullpath())
             if ok and (img.getXSize() > 512 or img.getYSize() > 512):
-                small = PNMImage(max(1, img.getXSize() // 4), max(1, img.getYSize() // 4))
+                small = PNMImage(max(1, img.getXSize() // 4), max(1, img.getYSize() // 4), img.getNumChannels())
                 small.quickFilterFrom(img)
                 img = small
             self.images[key] = img if ok else None
@@ -348,9 +373,86 @@ class GrassField:
     def wantsSurface(self, np, tex):
         if tex is None:
             return False
-        if SKIP_NAME.search(np.getName()):
+        name = np.getName()
+        if SKIP_NAME.search(name) or WATER_NAMES.search(name) or WATER_NAMES.search(tex.getName()):
             return False
-        return bool(GROUND_NAME.search(np.getName()) or GROUND_NAME.search(tex.getName()))
+        if GROUND_NAME.search(name) or GROUND_NAME.search(tex.getName()):
+            return True
+        # Many lawns carry no telling name (Daisy Gardens' are "o115_1").
+        # Any big, level, solid sheet is a candidate; only its green
+        # parts are planted, so paving and sand stay bare.
+        if NOT_LAWN.search(name) or NOT_LAWN.search(tex.getName()):
+            return False
+        trans = np.getNetState().getAttrib(TransparencyAttrib)
+        if trans is not None and trans.getMode() != TransparencyAttrib.MNone:
+            return False
+        bounds = np.getTightBounds()
+        if not bounds:
+            return False
+        size = bounds[1] - bounds[0]
+        return size[2] <= 1.5 and size[0] >= 30.0 and size[1] >= 30.0
+
+    def _isPaintedShadow(self, np, geomIndex):
+        """True for the dark see-through decals the artists laid on the
+        ground under trees, kerbs and props."""
+        node = np.node()
+        state = np.getNetState().compose(node.getGeomState(geomIndex))
+        attrib = state.getAttrib(TextureAttrib)
+        tex = attrib.getTexture() if attrib else None
+        if SHADOW_NAMES.search(np.getName()) or (tex is not None and SHADOW_NAMES.search(tex.getName())):
+            return True
+        trans = state.getAttrib(TransparencyAttrib)
+        if trans is None or trans.getMode() == TransparencyAttrib.MNone:
+            return False
+        # See-through as a whole (a flat colour or scale with low alpha).
+        color = state.getAttrib(ColorAttrib)
+        if color is not None and color.getColorType() == ColorAttrib.TFlat and color.getColor()[3] < 0.95:
+            return True
+        scale = state.getAttrib(ColorScaleAttrib)
+        if scale is not None and scale.getScale()[3] < 0.95:
+            return True
+        img = self._image(tex) if tex is not None else None
+        vdata = node.getGeom(geomIndex).getVertexData()
+        if img is None or not vdata.hasColumn('texcoord'):
+            return False
+        opacity = self._opacity(tex)
+        # Sampled inside its polygons (corners are often see-through even
+        # on solid art): a shadow is dark where it shows, and never fully
+        # solid anywhere; a painted pad or road is solid and coloured.
+        geom = node.getGeom(geomIndex).decompose()
+        reader = GeomVertexReader(vdata, 'texcoord')
+        vcolor = GeomVertexReader(vdata, 'color') if vdata.hasColumn('color') else None
+        bright, weight, solid, count = 0.0, 0.0, 0.0, 0
+        for prim in geom.getPrimitives():
+            if prim.getNumVerticesPerPrimitive() != 3:
+                continue
+            total = prim.getNumPrimitives()
+            for k in range(0, total, max(1, total // 16)):
+                st = prim.getPrimitiveStart(k)
+                u = v = tint = fade = 0.0
+                for vi in range(3):
+                    row = prim.getVertex(st + vi)
+                    reader.setRow(row)
+                    uv = reader.getData2()
+                    u += uv[0] / 3.0
+                    v += uv[1] / 3.0
+                    if vcolor is not None:
+                        vcolor.setRow(row)
+                        c = vcolor.getData4()
+                        tint += (c[0] + c[1] + c[2]) / 9.0
+                        fade += c[3] / 3.0
+                if vcolor is None:
+                    tint = fade = 1.0
+                x = min(max(int((u % 1.0) * img.getXSize()), 0), img.getXSize() - 1)
+                y = min(max(int((1.0 - v % 1.0) * img.getYSize()), 0), img.getYSize() - 1)
+                a = (opacity(u, v) if opacity is not None else 1.0) * fade
+                bright += img.getBright(x, y) * tint * a
+                weight += a
+                solid = max(solid, a)
+                count += 1
+        if count == 0:
+            return False
+        return solid < 0.8 or (weight > 0 and bright / weight < 0.25)
 
     def _coverTest(self, ground, cell):
         """Returns covered(x, y, z): is something lying over the lawn at
@@ -377,17 +479,37 @@ class GrassField:
             mat = np.getMat(render)
             node = np.node()
             for gi in range(node.getNumGeoms()):
+                if self._isPaintedShadow(np, gi):
+                    continue      # grass grows under a shadow, not around it
                 geom = node.getGeom(gi).decompose()
-                vr = GeomVertexReader(geom.getVertexData(), 'vertex')
+                vdata = geom.getVertexData()
+                vr = GeomVertexReader(vdata, 'vertex')
                 pos = []
                 while not vr.isAtEnd():
                     pos.append(mat.xformPoint(vr.getData3()))
+                # Cut-out art (a road with soft painted edges on a square
+                # sheet) only covers the lawn where it is actually opaque.
+                img, uvs = None, None
+                state = np.getNetState().compose(node.getGeomState(gi))
+                trans = state.getAttrib(TransparencyAttrib)
+                attrib = state.getAttrib(TextureAttrib)
+                isWater = np.hasNetTag('postfx-water') or WATER_NAMES.search(np.getName())
+                if (not isWater and trans is not None and trans.getMode() != TransparencyAttrib.MNone
+                        and attrib is not None and attrib.getTexture() is not None
+                        and vdata.hasColumn('texcoord')):
+                    img = self._opacity(attrib.getTexture())
+                    if img is not None:
+                        tr = GeomVertexReader(vdata, 'texcoord')
+                        uvs = []
+                        while not tr.isAtEnd():
+                            uvs.append(tr.getData2())
                 for prim in geom.getPrimitives():
                     if prim.getNumVerticesPerPrimitive() != 3:
                         continue
                     for k in range(prim.getNumPrimitives()):
                         st = prim.getPrimitiveStart(k)
-                        a, b, c = pos[prim.getVertex(st)], pos[prim.getVertex(st + 1)], pos[prim.getVertex(st + 2)]
+                        ia, ib, ic = prim.getVertex(st), prim.getVertex(st + 1), prim.getVertex(st + 2)
+                        a, b, c = pos[ia], pos[ib], pos[ic]
                         det = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
                         if abs(det) < 1e-6:
                             continue      # edge-on from above: a wall
@@ -397,7 +519,7 @@ class GrassField:
                         n = (b - a).cross(c - a)
                         if not n.normalize() or abs(n[2]) < 0.3:
                             continue
-                        tri = (a, b, c, det)
+                        tri = (a, b, c, det, img, (uvs[ia], uvs[ib], uvs[ic]) if img is not None else None)
                         x0, x1 = min(a[0], b[0], c[0]), max(a[0], b[0], c[0])
                         y0, y1 = min(a[1], b[1], c[1]), max(a[1], b[1], c[1])
                         x0, x1 = max(x0, gmin[0]), min(x1, gmax[0])
@@ -407,7 +529,7 @@ class GrassField:
                                 buckets.setdefault((gx, gy), []).append(tri)
 
         def covered(x, y, z):
-            for a, b, c, det in buckets.get((int(math.floor(x / cell)), int(math.floor(y / cell))), ()):
+            for a, b, c, det, img, uv in buckets.get((int(math.floor(x / cell)), int(math.floor(y / cell))), ()):
                 w0 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / det
                 w1 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / det
                 w2 = 1.0 - w0 - w1
@@ -415,6 +537,13 @@ class GrassField:
                     continue
                 dz = w0 * a[2] + w1 * b[2] + w2 * c[2] - z
                 if COVER_MIN < dz < COVER_HEIGHT:
+                    # Only for things lying on the lawn; leaf canopies and
+                    # the like overhead keep covering as a whole.
+                    if img is not None and dz < 0.3:
+                        u = uv[0][0] * w0 + uv[1][0] * w1 + uv[2][0] * w2
+                        v = uv[0][1] * w0 + uv[1][1] * w1 + uv[2][1] * w2
+                        if img(u, v) < 0.85:    # soft painted edges still show lawn
+                            continue
                     return True
             return False
         return covered
