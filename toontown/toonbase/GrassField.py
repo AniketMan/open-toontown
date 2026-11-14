@@ -24,9 +24,10 @@ hidden and removed along with their zone.
 """
 import math
 import random
+import time
 import re
 
-from panda3d.core import (BitMask32, Character, TransparencyAttrib, Texture, ColorAttrib, ColorScaleAttrib, BoundingBox, ColorBlendAttrib,
+from panda3d.core import (ConfigVariableDouble, TransformState, BitMask32, Character, TransparencyAttrib, Texture, ColorAttrib, ColorScaleAttrib, BoundingBox, ColorBlendAttrib,
                           CullFaceAttrib, SamplerState, Geom, GeomNode,
                           GeomTriangles, GeomVertexData, GeomVertexFormat,
                           GeomVertexReader, GeomVertexWriter, LODNode,
@@ -60,6 +61,9 @@ LOD_SWITCH = FADE_MID + BLOCK_SIZE * 0.75
 VIEW_DISTANCE = FADE_FAR       # blades are gone by here
 MAX_BUMP = 0.2                 # how far ground may stray from a tile's plane
 MAX_TILES = 12000
+MAX_LAWN = 800.0       # feet across; anything wider is not planted
+# Milliseconds a frame may spend planting grass; 0 plants it all at once.
+PLANT_BUDGET = ConfigVariableDouble('grass-plant-ms', 5.0).value
 # No grass where something else lies over the lawn within this many feet:
 # pond water, sidewalks, steps, hedges.  (Flat decals such as drop shadows,
 # which sit a hair above the ground, do not count.)
@@ -211,6 +215,24 @@ def isGreen(c):
     return g > 0.25 and g > r * 1.12 and g > b * 1.25
 
 
+def geomNodes(root):
+    """Every GeomNode under root, as findAllMatches('**/+GeomNode') gives,
+    but without walking into planted grass: its thousands of tiles made
+    that search take a quarter of a second."""
+    found = []
+    stack = [root]
+    while stack:
+        np = stack.pop()
+        node = np.node()
+        if node.hasTag('postfx-grass'):
+            continue
+        if node.isGeomNode():
+            found.append(np)
+        if node.getNumChildren():
+            stack.extend(np.getChildren())
+    return found
+
+
 class GrassField:
     notify = DirectNotifyGlobal.directNotify.newCategory('GrassField')
 
@@ -221,6 +243,8 @@ class GrassField:
         self.tiles = {}
         self.images = {}
         self.tileCount = 0
+        self.pending = []              # lawns still being planted
+        self.lawns = []                # (holder, [tiles]) of planted lawns
         rng = random.Random(7)
         self.farTiles = {}
         for size in TILE_SIZES:
@@ -376,6 +400,12 @@ class GrassField:
         name = np.getName()
         if SKIP_NAME.search(name) or WATER_NAMES.search(name) or WATER_NAMES.search(tex.getName()):
             return False
+        bounds = np.getTightBounds()
+        if not bounds:
+            return False
+        size = bounds[1] - bounds[0]
+        if max(size[0], size[1]) > MAX_LAWN:
+            return False      # a racetrack's infield: far more than MAX_TILES
         if GROUND_NAME.search(name) or GROUND_NAME.search(tex.getName()):
             return True
         # Many lawns carry no telling name (Daisy Gardens' are "o115_1").
@@ -386,10 +416,6 @@ class GrassField:
         trans = np.getNetState().getAttrib(TransparencyAttrib)
         if trans is not None and trans.getMode() != TransparencyAttrib.MNone:
             return False
-        bounds = np.getTightBounds()
-        if not bounds:
-            return False
-        size = bounds[1] - bounds[0]
         return size[2] <= 1.5 and size[0] >= 30.0 and size[1] >= 30.0
 
     def _isPaintedShadow(self, np, geomIndex):
@@ -455,7 +481,8 @@ class GrassField:
         return solid < 0.8 or (weight > 0 and bright / weight < 0.25)
 
     def _coverTest(self, ground, cell):
-        """Returns covered(x, y, z): is something lying over the lawn at
+        """A generator, so the work can be spread over frames, that
+        returns covered(x, y, z): is something lying over the lawn at
         this point?  Looks at every other visible, roughly level surface
         that overlaps the lawn."""
         render = self.base.render
@@ -464,7 +491,10 @@ class GrassField:
             return lambda x, y, z: False
         gmin, gmax = bounds
         buckets = {}
-        for np in render.findAllMatches('**/+GeomNode'):
+        for np in geomNodes(render):
+            yield
+            if np.isEmpty():
+                continue
             if np == ground or np.hasNetTag('postfx-grass') or np.isHidden():
                 continue
             if any(isinstance(a.node(), Character) for a in np.getAncestors()):
@@ -549,19 +579,59 @@ class GrassField:
         return covered
 
     def addSurface(self, np, geomIndex, tex):
-        """Covers the green parts of one ground geom with grass.
-        Returns the number of tiles placed."""
+        """Queues one ground geom to have its green parts covered with
+        grass.  The planting is spread over the following frames, nearest
+        the camera first, so walking into a playground does not stall."""
+        self.pending.append(self._plant(np, geomIndex, tex))
+        if PLANT_BUDGET <= 0:
+            self.finish()
+        elif not self.base.taskMgr.hasTaskNamed('grass-plant'):
+            self.base.taskMgr.add(self._plantTask, 'grass-plant', sort=48)
+
+    def finish(self):
+        """Plants everything still queued, now."""
+        while self.pending:
+            for _ in self.pending.pop(0):
+                pass
+
+    def _plantTask(self, task):
+        end = time.time() + PLANT_BUDGET / 1000.0
+        while self.pending:
+            try:
+                next(self.pending[0])
+            except StopIteration:
+                self.pending.pop(0)
+            if time.time() >= end:
+                break
+        return task.cont if self.pending else task.done
+
+    def _prune(self):
+        """Stops counting the grass of places that have been unloaded."""
+        render = self.base.render
+        live = []
+        for holder, placed in self.lawns:
+            if holder.isEmpty() or not render.isAncestorOf(holder):
+                self.tileCount -= placed[0]
+            else:
+                live.append((holder, placed))
+        self.lawns = live
+
+    def _plant(self, np, geomIndex, tex):
+        self._prune()
         if self.tileCount >= MAX_TILES:
-            return 0
+            return
         img = self._image(tex)
         if img is None:
-            return 0
+            return
+        yield
+        if np.isEmpty():
+            return
         render = self.base.render
         node = np.node()
         geom = node.getGeom(geomIndex).decompose()
         vdata = geom.getVertexData()
         if not vdata.hasColumn('texcoord'):
-            return 0
+            return
         mat = np.getMat(render)
         vr = GeomVertexReader(vdata, 'vertex')
         tr = GeomVertexReader(vdata, 'texcoord')
@@ -578,6 +648,8 @@ class GrassField:
             if prim.getNumVerticesPerPrimitive() != 3:
                 continue
             for k in range(prim.getNumPrimitives()):
+                if k % 400 == 399:
+                    yield
                 s = prim.getPrimitiveStart(k)
                 ia, ib, ic = prim.getVertex(s), prim.getVertex(s + 1), prim.getVertex(s + 2)
                 a, b, c = pos[ia], pos[ib], pos[ic]
@@ -599,10 +671,29 @@ class GrassField:
                     for gy in range(int(math.floor(y0 / cell)), int(math.floor(y1 / cell)) + 1):
                         buckets.setdefault((gx, gy), []).append(ti)
         if not tris:
-            return 0
+            return
+        yield
         iw, ih = img.getXSize(), img.getYSize()
-        covered = self._coverTest(np, cell)
+        covered = yield from self._coverTest(np, cell)
         bare = (0.0, 0.0, 0.0)
+        yield
+        if np.isEmpty() or not render.isAncestorOf(np):
+            np.clearTag('postfx-grass-done')
+            return
+
+        # The grass lives under the ground it grows on, so it is hidden and
+        # removed with it, but is laid out in world space.
+        holder = np.attachNewNode('postfx-grass')
+        holder.setTransform(render, TransformState.makeIdentity())
+        holder.setTag('postfx-grass', '1')
+        holder.setShader(self.shader)
+        holder.setShaderInput('grassParams', Vec4(FADE_NEAR, FADE_MID, FADE_FAR, 0))
+        holder.setShaderInput('grassWind', Vec4(WIND_STRENGTH, KEEP_FRACTION, 0, 0))
+        holder.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullNone))
+        holder.setTextureOff(1)
+        holder.setLightOff(1)
+        holder.setFogOff(1)
+        holder.hide(self.hideFrom | BitMask32.bit(8))    # bit 8: ToonWater's depth camera
 
         def sample(x, y):
             """(z, colour, normal) of the ground at x, y, or None."""
@@ -625,14 +716,14 @@ class GrassField:
 
         blocks = {}
         placed = [0]
-        hideMask = self.hideFrom
+        self.lawns.append((holder, placed))
 
         def block(x, y):
             """(near, far) parents for tiles around x, y."""
             key = (int(math.floor(x / BLOCK_SIZE)), int(math.floor(y / BLOCK_SIZE)))
             if key not in blocks:
                 lod = LODNode('grass-block')
-                lodNp = render.attachNewNode(lod)
+                lodNp = holder.attachNewNode(lod)
                 lodNp.setPos((key[0] + 0.5) * BLOCK_SIZE, (key[1] + 0.5) * BLOCK_SIZE, 0)
                 lod.addSwitch(LOD_SWITCH, 0)
                 near = lodNp.attachNewNode('near')
@@ -661,10 +752,11 @@ class GrassField:
             farInst.setColorScale(colour[0], colour[1], colour[2], 1.0)
             self.farTiles[size].instanceTo(farInst)
             placed[0] += 1
+            self.tileCount += 1
 
         def cover(x, y, size):
             """x, y is the centre of a square patch of this size."""
-            if self.tileCount + placed[0] >= MAX_TILES:
+            if self.tileCount >= MAX_TILES:
                 return
             mid = sample(x, y)
             h = size / 2.0
@@ -703,26 +795,21 @@ class GrassField:
                 cover(x + ox, y + oy, size / 2.0)
 
         big = TILE_SIZES[0]
-        for (gx, gy) in list(buckets.keys()):
+        eye = self.base.camera.getPos(render)
+        order = sorted(buckets.keys(), key=lambda k: ((k[0] + 0.5) * big - eye[0]) ** 2
+                                                     + ((k[1] + 0.5) * big - eye[1]) ** 2)
+        for (gx, gy) in order:
             cover((gx + 0.5) * big, (gy + 0.5) * big, big)
+            yield
+            if holder.isEmpty() or not render.isAncestorOf(np):
+                # The place was unloaded while its lawn was being planted.
+                if not holder.isEmpty():
+                    holder.removeNode()
+                np.clearTag('postfx-grass-done')
+                return
 
         if not blocks:
-            return 0
+            holder.removeNode()
+            return
         self._addMeadow(np)
-        holder = render.attachNewNode('postfx-grass')
-        holder.setTag('postfx-grass', '1')
-        holder.setShader(self.shader)
-        holder.setShaderInput('grassParams', Vec4(FADE_NEAR, FADE_MID, FADE_FAR, 0))
-        holder.setShaderInput('grassWind', Vec4(WIND_STRENGTH, KEEP_FRACTION, 0, 0))
-        holder.setAttrib(CullFaceAttrib.make(CullFaceAttrib.MCullNone))
-        holder.setTextureOff(1)
-        holder.setLightOff(1)
-        holder.setFogOff(1)
-        holder.hide(hideMask | BitMask32.bit(8))    # bit 8: ToonWater's depth camera
-        for near, far, lodNp in blocks.values():
-            lodNp.reparentTo(holder)
-        # Live under the ground it grows on: hidden and removed with it.
-        holder.wrtReparentTo(np)
-        self.tileCount += placed[0]
         self.notify.info('%d grass tiles on %s' % (placed[0], np.getName()))
-        return placed[0]

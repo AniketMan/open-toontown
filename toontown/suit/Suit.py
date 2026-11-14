@@ -165,6 +165,40 @@ HeadModelDict = {'a': ('/models/char/suitA-', 4),
  'b': ('/models/char/suitB-', 4),
  'c': ('/models/char/suitC-', 3.5)}
 
+# Replacement HD models (tools/ENEMY_MODEL_SWAP.md): one file per enemy, body and
+# head together, skinned to the original body's skeleton so the existing
+# animations drive it.  A slot is used only when its file is on the model path
+# (resources-hd/phase_3.5/models/char/<slot>_hd.bam); otherwise the enemy is
+# assembled from the shared body and head pieces as before.
+HD_SLOTS = {'f': '01_Flunky_Bossbot', 'p': '02_Pencil-Pusher_Bossbot', 'ym': '03_Yesman_Bossbot',
+ 'mm': '04_Micromanager_Bossbot', 'ds': '05_Downsizer_Bossbot', 'hh': '06_Head-Hunter_Bossbot',
+ 'cr': '07_Corporate-Raider_Bossbot', 'tbc': '08_The-Big-Cheese_Bossbot',
+ 'bf': '09_Bottom-Feeder_Lawbot', 'b': '10_Bloodsucker_Lawbot', 'dt': '11_Double-Talker_Lawbot',
+ 'ac': '12_Ambulance-Chaser_Lawbot', 'bs': '13_Back-Stabber_Lawbot', 'sd': '14_Spin-Doctor_Lawbot',
+ 'le': '15_Legal-Eagle_Lawbot', 'bw': '16_Big-Wig_Lawbot',
+ 'sc': '17_Short-Change_Cashbot', 'pp': '18_Penny-Pincher_Cashbot', 'tw': '19_Tightwad_Cashbot',
+ 'bc': '20_Bean-Counter_Cashbot', 'nc': '21_Number-Cruncher_Cashbot', 'mb': '22_Money-Bags_Cashbot',
+ 'ls': '23_Loan-Shark_Cashbot', 'rb': '24_Robber-Baron_Cashbot',
+ 'cc': '25_Cold-Caller_Sellbot', 'tm': '26_Telemarketer_Sellbot', 'nd': '27_Name-Dropper_Sellbot',
+ 'gh': '28_Glad-Hander_Sellbot', 'ms': '29_Mover-Shaker_Sellbot', 'tf': '30_Two-Face_Sellbot',
+ 'm': '31_The-Mingler_Sellbot', 'mh': '32_Mr-Hollywood_Sellbot'}
+_hdModelPaths = {}
+
+
+def hdModelPath(dnaName):
+    """Model path of this enemy's HD replacement, or None if there isn't one."""
+    if not ConfigVariableBool('want-hd-suits', True).value:
+        return None
+    if dnaName not in _hdModelPaths:
+        path = None
+        slot = HD_SLOTS.get(dnaName)
+        if slot:
+            candidate = 'phase_3.5/models/char/%s_hd' % slot
+            if VirtualFileSystem.getGlobalPtr().resolveFilename(Filename(candidate + '.bam'), getModelPath().getValue()):
+                path = candidate
+        _hdModelPaths[dnaName] = path
+    return _hdModelPaths[dnaName]
+
 def loadTutorialSuit():
     loader.loadModel('phase_3.5/models/char/suitC-mod').node()
     loadDialog(1)
@@ -345,6 +379,7 @@ class Suit(Avatar.Avatar):
         self.isDisguised = 0
         self.isWaiter = 0
         self.isRental = 0
+        self.hdModel = False
         return
 
     def delete(self):
@@ -401,6 +436,7 @@ class Suit(Avatar.Avatar):
         self.headTexture = None
         self.loseActor = None
         self.isSkeleton = 0
+        self.hdModel = False
         if dna.name == 'f':
             self.scale = 4.0 / cSize
             self.handColor = SuitDNA.corpPolyColor
@@ -612,7 +648,12 @@ class Suit(Avatar.Avatar):
     def generateBody(self):
         animDict = self.generateAnimDict()
         filePrefix, bodyPhase = ModelDict[self.style.body]
-        if ConfigVariableBool('want-new-cogs', 0).value:
+        hdPath = hdModelPath(self.style.name)
+        if hdPath:
+            # body and head in one model, on the same skeleton: the animations below bind to it unchanged
+            self.loadModel(hdPath)
+            self.hdModel = True
+        elif ConfigVariableBool('want-new-cogs', 0).value:
             if cogExists(filePrefix + 'zero.bam'):
                 self.loadModel('phase_3.5' + filePrefix + 'zero')
             else:
@@ -675,6 +716,13 @@ class Suit(Avatar.Avatar):
             modelRoot = self
         dept = self.style.dept
         phase = 3.5
+        if self.hdModel and modelRoot is self:
+            # an HD model carries its own textures; it only needs the joints looked up
+            self.leftHand = self.find('**/joint_Lhold')
+            self.rightHand = self.find('**/joint_Rhold')
+            self.shadowJoint = self.find('**/joint_shadow')
+            self.nametagJoint = self.find('**/joint_nameTag')
+            return
 
         def __doItTheOldWay__():
             torsoTex = loader.loadTexture('phase_%s/maps/%s_blazer.jpg' % (phase, dept))
@@ -722,6 +770,8 @@ class Suit(Avatar.Avatar):
         if not modelRoot:
             modelRoot = self
         self.isWaiter = 1
+        if self.hdModel and modelRoot is self:
+            return  # the HD model has no separate torso/arms/legs to re-dress
         torsoTex = loader.loadTexture('phase_3.5/maps/waiter_m_blazer.jpg')
         torsoTex.setMinfilter(Texture.FTLinearMipmapLinear)
         torsoTex.setMagfilter(Texture.FTLinear)
@@ -753,6 +803,8 @@ class Suit(Avatar.Avatar):
         modelRoot.find('**/hands').setTexture(handTex, 1)
 
     def generateHead(self, headType):
+        if self.hdModel:
+            return  # the head is part of the HD model
         if ConfigVariableBool('want-new-cogs', 0).value:
             filePrefix, phase = HeadModelDict[self.style.body]
         else:
@@ -816,6 +868,9 @@ class Suit(Avatar.Avatar):
             self.corpMedallion = icons.find('**/MoneyIcon').copyTo(chestNull)
         self.corpMedallion.setPosHprScale(0.02, 0.05, 0.04, 180.0, 0.0, 0.0, 0.51, 0.51, 0.51)
         self.corpMedallion.setColor(self.medallionColors[dept])
+        if self.hdModel:
+            # the HD model wears its own medallion; keep the icon node (the avatar panel copies it) but out of the scene
+            self.corpMedallion.stash()
         icons.removeNode()
 
     def generateHealthBar(self):
@@ -952,6 +1007,7 @@ class Suit(Avatar.Avatar):
         if not dropShadow.isEmpty():
             dropShadow.reparentTo(hidden)
         self.removePart('modelRoot')
+        self.hdModel = False  # skeletons use the original robot model
         self.loadModel(model)
         self.loadAnims(anims)
         self.getGeomNode().setScale(self.scale * 1.0173)

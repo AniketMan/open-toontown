@@ -898,7 +898,7 @@ class PostFX(DirectObject):
         if self._materialScans % 20 == 0:
             seen.clear()    # pointers get reused; start over now and then
         bound = 0
-        for np in base.render.findAllMatches('**/+GeomNode'):
+        for np in GrassFieldModule.geomNodes(base.render):
             node = np.node()
             key = (node.this, node.getNumGeoms())
             if key in seen:
