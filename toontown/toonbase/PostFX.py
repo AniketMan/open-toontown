@@ -1187,6 +1187,12 @@ class PostFX(DirectObject):
         playGame = getattr(cr, 'playGame', None)
         if playGame is None:
             return ConfigVariableBool('postfx-shadows-everywhere', False).value
+        # In a walk-in shop it is the side of the doorway the camera is on
+        # that counts, not which place the server has the toon in.
+        import sys
+        rooms = sys.modules.get('toontown.building.OpenInteriors')
+        if rooms is not None and rooms.viewOutdoors is not None:
+            return rooms.viewOutdoors
         place = playGame.getPlace()
         if place is None:
             return False

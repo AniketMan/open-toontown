@@ -23,6 +23,7 @@ from direct.interval.IntervalGlobal import (
 
 from direct.showbase.MessengerGlobal import messenger
 from direct.task.TaskManagerGlobal import taskMgr
+from direct.task import Task
 
 from toontown.building import DoorTypes
 from toontown.building import FADoorCodes
@@ -101,7 +102,8 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         self.ignore('clearOutToonInterior')
         self.fsm.request('off')
         self.exitDoorFSM.request('off')
-        OpenInteriors.doorwayClosed(self)
+        if not OpenInteriors.handingOver:
+            OpenInteriors.doorwayClosed(self)
         if 'building' in self.__dict__:
             del self.building
 
@@ -279,6 +281,20 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         other side of it, already through the open door and walking, and
         dissolve the held picture of the old place into this."""
         avatar = base.localAvatar
+        if OpenInteriors.walkedThrough:
+            # The player walked through and is still walking: nothing to
+            # place, nothing to play.  Give the controls straight back.
+            OpenInteriors.walkedThrough = False
+            OpenInteriors.handingOver = False
+            self.poseExitDoorOpen()
+            self.hideBuildingShell()
+            self.arrivedEarly = True
+            self.arrivedWalking = True
+            base.transitions.noTransitions()
+            FrameHold.release(0)
+            taskMgr.doMethodLater(0, self.walkOn, self.uniqueName('walkOn'))
+            taskMgr.doMethodLater(1.2, self.showBuildingShell, self.uniqueName('showBuildingShell'))
+            return
         otherNP = self.getDoorNodePath()
         if otherNP is None or otherNP.isEmpty():
             base.transitions.noTransitions()
@@ -340,6 +356,12 @@ class DistributedDoor(DistributedObject, DelayDeletable):
     def showBuildingShellSoon(self):
         if getattr(self, 'hiddenShell', None) is not None:
             taskMgr.doMethodLater(0.6, self.showBuildingShell, self.uniqueName('showBuildingShell'))
+
+    def walkOn(self, task=None):
+        place = self.cr.playGame.getPlace()
+        if place is not None and place.fsm.getCurrentState().getName() == 'doorIn':
+            place.setState('walk')
+        return Task.done if task is not None else None
 
     def poseExitDoorOpen(self):
         """Shows the leaf the local toon comes out through standing open.
@@ -419,7 +441,15 @@ class DistributedDoor(DistributedObject, DelayDeletable):
 
     def enterDoor(self):
         if self.allowedToEnter():
-            messenger.send('DistributedDoor_doorTrigger')
+            # A shop door with its room standing behind it is walked
+            # through by the player; any other door plays the game's own
+            # sequence.
+            self.walkThrough = (self.doorType in (DoorTypes.EXT_STANDARD, DoorTypes.INT_STANDARD)
+                                and OpenInteriors.beginWalk(self, self.doorType == DoorTypes.INT_STANDARD))
+            if self.walkThrough:
+                self.swingOpenNow()
+            else:
+                messenger.send('DistributedDoor_doorTrigger')
             self.sendUpdate('requestEnter')
         else:
             place = base.cr.playGame.getPlace()
@@ -480,6 +510,11 @@ class DistributedDoor(DistributedObject, DelayDeletable):
 
     def avatarEnter(self, avatarID):
         avatar = self.cr.doId2do.get(avatarID, None)
+        if avatar and avatarID == base.localAvatar.doId and getattr(self, 'walkThrough', False):
+            # The player is walking in under their own control: no lining
+            # up at the door.
+            self.avatarIDList.append(avatarID)
+            return
         if avatar:
             avatar.setAnimState('neutral')
             track = self.avatarEnqueueTrack(avatar, 0.5)
@@ -706,6 +741,13 @@ class DistributedDoor(DistributedObject, DelayDeletable):
     def enterClosed(self, ts):
         if self.doorType in (DoorTypes.EXT_STANDARD, DoorTypes.INT_STANDARD):
             OpenInteriors.doorwayClosed(self)
+        self.swungOpenAt = None
+        if getattr(self, 'walkThrough', False):
+            # The door shut without the player going in: it can be tried again.
+            self.walkThrough = False
+            if not OpenInteriors.walkDone(self):
+                OpenInteriors.endWalk()
+                self.accept(self.getEnterTriggerEvent(), self.doorTrigger)
 
     def exitClosed(self):
         pass
@@ -734,15 +776,47 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         else:
             h = -100
 
+        if getattr(self, 'swungOpenAt', None) is not None:
+            # The player pushed this door open already (swingOpenNow); the
+            # server has only now caught up.  It stays as it is.
+            return
         self.finishDoorTrack()
         self.doorTrack = Parallel(SoundInterval(self.openSfx, node=rightDoor), Sequence(HprInterval(rightDoor, VBase3(0, 0, 0), other=otherNP), Wait(0.4), Func(rightDoor.show), Func(doorFrameHoleRight.show), LerpHprInterval(nodePath=rightDoor, duration=0.6, hpr=VBase3(h, 0, 0), startHpr=VBase3(0, 0, 0), other=otherNP, blendType='easeInOut')), name=trackName)
         self.doorTrack.start(ts)
+
+    def swingOpenNow(self):
+        """The player has walked up to this door: swing it open at once,
+        without waiting to hear back from the server."""
+        hole = self.findDoorNode('doorFrameHoleRight', True)
+        rightDoor = self.findDoorNode('rightDoor', True)
+        if hole is None or hole.isEmpty() or rightDoor is None or rightDoor.isEmpty():
+            return
+        if self.doorType == DoorTypes.EXT_STANDARD:
+            OpenInteriors.doorwayOpened(self)
+        elif self.doorType == DoorTypes.INT_STANDARD:
+            OpenInteriors.doorwayOpened(self, inside=True)
+        otherNP = self.getDoorNodePath()
+        h = 100 if self.rightSwing else -100
+        self.finishDoorTrack()
+        rightDoor.show()
+        hole.show()
+        self.swungOpenAt = globalClock.getFrameTime()
+        self.doorTrack = Parallel(SoundInterval(self.openSfx, node=rightDoor),
+                                  LerpHprInterval(nodePath=rightDoor, duration=0.28, hpr=VBase3(h, 0, 0), startHpr=VBase3(0, 0, 0), other=otherNP, blendType='easeOut'),
+                                  name='doorSwing-%d' % self.doId)
+        self.doorTrack.start()
+
+    def isSwungOpen(self):
+        at = getattr(self, 'swungOpenAt', None)
+        return at is not None and globalClock.getFrameTime() - at > 0.16
 
     def exitOpening(self):
         pass
 
     def enterOpen(self, ts):
         for avatarID in self.avatarIDList:
+            if avatarID == base.localAvatar.doId and getattr(self, 'walkThrough', False):
+                continue        # the player walks in under their own control
             avatar = self.cr.doId2do.get(avatarID)
             if avatar:
                 track = self.avatarEnterDoorTrack(avatar, 1.0)
@@ -827,6 +901,10 @@ class DistributedDoor(DistributedObject, DelayDeletable):
 
     def exitDoorEnterOpen(self, ts):
         for avatarID in self.avatarExitIDList:
+            if avatarID == base.localAvatar.doId and getattr(self, 'arrivedWalking', False):
+                self.arrivedWalking = False
+                self.arrivedEarly = False
+                continue        # the player is already walking on
             avatar = self.cr.doId2do.get(avatarID)
             if avatar:
                 track = self.avatarExitTrack(avatar, 0.2)

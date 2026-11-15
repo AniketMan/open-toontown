@@ -256,7 +256,8 @@ class Playground(Place):
             node.removeNode()
 
         del self.tunnelOriginList
-        self.loader.geom.reparentTo(base.hidden)
+        if not OpenInteriors.handingOver:
+            self.loader.geom.reparentTo(base.hidden)
 
         def __lightDecorationOff__():
             for light in self.loader.hood.halloweenLights:

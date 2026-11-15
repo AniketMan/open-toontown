@@ -142,7 +142,8 @@ class Street(BattlePlace.BattlePlace):
     def exit(self, visibilityFlag = 1):
         if visibilityFlag:
             self.visibilityOff()
-        self.loader.geom.reparentTo(hidden)
+        if not OpenInteriors.handingOver:
+            self.loader.geom.reparentTo(hidden)
         self._telemLimiter.destroy()
         del self._telemLimiter
 

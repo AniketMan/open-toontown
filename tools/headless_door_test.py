@@ -45,11 +45,11 @@ def drive(task):
     now = globalClock.getRealTime(); S['f'] += 1
     if S['rec']:
         S['n'] += 1
-        if now - S.get('last', 0) < 0.04: return_early = True
+        if now - S.get('last', 0) < 0.045: return_early = True
         else:
             return_early = False; S['last'] = now; S['k'] = S.get('k', 0) + 1
             fn = '%s/%s_%03d.png' % (out, S['rec'], S['k'])
-            if 30 <= S['k'] <= 90:
+            if False:
                 im = PNMImage(); base.win.getScreenshot(im); FRAMES.append((fn, im))
                 print('SHOT %s %03d t=%.3f held=%s place=%s' % (S['rec'], S['k'], now, FrameHold.isHeld(), placeState()))
         print('REC %s %03d t=%.3f dt=%.0fms held=%s place=%s' % (S['rec'], S['n'] - 1, now, globalClock.getDt() * 1000, FrameHold.isHeld(), placeState())); sys.stdout.flush()
@@ -79,51 +79,45 @@ def drive(task):
         elif now - S['t'] > 40: log('TIMEOUT tp', ps); S['step'] = 'quit'
     elif step == 'settle' and now - S['t'] > 4:
         ds = doors((DoorTypes.EXT_STANDARD, DoorTypes.EXT_HQ, DoorTypes.EXT_KS)); S['home'] = placeState()[0]
-        log('ext doors', len(ds), [(d.doorType, d.doId) for d in ds][:10])
         ds = [d for d in ds if d.doorType == int(os.environ.get('DTYPE', d.doorType))]; d = ds[int(os.environ.get('DIDX', 0)) % len(ds)]; S['door'] = d; log('using', d.doorType, getattr(d, 'block', None))
-        np = d.getDoorNodePath()
-        base.localAvatar.setPosHpr(np, 0, -10, 0, 0, 0, 0)
+        t = OI.doorTransform(cr.playGame.dnaStore, d.block)
+        fr = render.attachNewNode('fr'); fr.setPosHpr(t.getPos(), t.getHpr())
+        base.localAvatar.setPosHpr(fr, d.doorX, -9, 0, 0, 0, 0); fr.removeNode()
         S['step'] = 'approach'; S['t'] = now
     elif step == 'approach' and now - S['t'] > 1.5:
-        base.win.saveScreenshot(Filename(out + '/before.png'))
-        S['rec'] = 'in'; S['n'] = 0
-        log('enterDoor'); S['door'].enterDoor(); S['step'] = 'entering'; S['t'] = now
+        S['rec'] = 'in'; S['n'] = 0; S['k'] = 0
+        from direct.showbase.InputStateGlobal import inputState
+        S['is'] = inputState
+        log('walking forward'); inputState.set('forward', True); S['step'] = 'entering'; S['t'] = now
     elif step == 'entering':
         ps = placeState()
+        if now - S.get('lg', 0) > 0.5:
+            S['lg'] = now; d = S['door']
+            fr = OI.walk['frame'] if OI.walk else None
+            try: st = d.fsm.getCurrentState().getName()
+            except Exception: st = '?'
+            log('  ', ps, 'in door frame', [round(x, 1) for x in base.localAvatar.getPos(fr)] if fr else None, 'walk', OI.walk is not None, 'door', st, 'wt', getattr(d, 'walkThrough', None), 'walls', OI._wallsOn, 'handing', OI.handingOver)
         if ps[0] not in (None, S['home']) and ps[1] == 'walk' and not S.get('inside'):
             S['inside'] = now; log('inside walk after %.2fs' % (now - S['t']))
-        if S.get('inside') and now - S['inside'] > 1.5 and not S.get('over'):
-            S['over'] = 1
-            room = render.find('toon-interior-root'); av = base.localAvatar
-            print('DBG room', room, room.getTightBounds(render) if not room.isEmpty() else None, 'pos', room.getPos(render) if not room.isEmpty() else None, 'hpr', room.getHpr(render) if not room.isEmpty() else None)
-            print('DBG avatar', av.getPos(render), av.getHpr(render), 'cam', base.camera.getPos(render))
-            g = OI._outside[0] if OI._outside else None
-            if g is not None:
-                kids = g.getChildren(); st = g.getStashedChildren()
-                print('DBG geom', g, 'hidden', g.isHidden(), 'kids', kids.getNumPaths(), 'stashed kids', st.getNumPaths(), 'bounds', g.getTightBounds(render))
-                deep = g.findAllMatches('**/+GeomNode'); print('DBG geomnodes', deep.getNumPaths(), 'stashed anywhere', g.findAllMatches('**/*;+s').getNumPaths() - g.findAllMatches('**/*').getNumPaths(), 'drawmask', g.node().getDrawShowMask(), g.node().getDrawControlMask())
-                for k in list(kids)[:6]: print('   kid', k.getName(), 'hidden', k.isHidden(), k.getNumChildren(), len(k.getStashedChildren()))
-            d = room.find('**/door_origin') if not room.isEmpty() else None
-            print('DBG int door', d.getPos(render), d.getHpr(render)) if d else None
-            for dist, nm in ((90, 'over_far'), (45, 'over_near')):
-                keep = (base.cam.getParent(), base.cam.getTransform())
-                base.cam.reparentTo(render); base.cam.setPos(av.getPos(render) + Vec3(0, -dist * 0.5, dist)); base.cam.lookAt(av.getPos(render))
-                base.graphicsEngine.renderFrame(); base.graphicsEngine.renderFrame()
-                base.win.saveScreenshot(Filename(out + '/' + nm + '.png'))
-                base.cam.reparentTo(keep[0]); base.cam.setTransform(keep[1])
-        if S.get('inside') and now - S['inside'] > 2.5:
-            S['rec'] = None
+        if S.get('inside') and now - S['inside'] > 1.2 and not S.get('stopped'):
+            S['stopped'] = 1; S['is'].set('forward', False); S['rec'] = None
             base.win.saveScreenshot(Filename(out + '/inside.png'))
-            ds = doors((DoorTypes.INT_STANDARD, DoorTypes.INT_HQ, DoorTypes.INT_KS)); log('int doors', len(ds))
+        if S.get('inside') and now - S['inside'] > 3.0:
+            base.localAvatar.setH(base.localAvatar.getH() + 180)
             S['rec'] = 'out'; S['n'] = 0; S['k'] = 0
-            ds[0].enterDoor(); S['step'] = 'leaving'; S['t'] = now
-        elif now - S['t'] > 25:
+            log('walking back out'); S['is'].set('forward', True); S['step'] = 'leaving'; S['t'] = now
+        elif now - S['t'] > 9:
             log('TIMEOUT entering', ps); S['step'] = 'quit'
     elif step == 'leaving':
         ps = placeState()
+        if now - S.get('lg', 0) > 0.5:
+            S['lg'] = now; fr = OI.walk['frame'] if OI.walk else None
+            log('  ', ps, 'in door frame', [round(x, 1) for x in base.localAvatar.getPos(fr)] if fr else [round(x, 1) for x in base.localAvatar.getPos(render)], 'walk', OI.walk is not None, 'walls', OI._wallsOn, 'handing', OI.handingOver)
         if ps[0] == S['home'] and ps[1] == 'walk' and not S.get('outside'):
             S['outside'] = now; log('outside walk after %.2fs' % (now - S['t']))
-        if S.get('outside') and now - S['outside'] > 2.0 or now - S['t'] > 25:
+        if S.get('outside') and now - S['outside'] > 1.5 or now - S['t'] > 25:
+            S['is'].set('forward', False)
+            if not S.get('outside'): log('TIMEOUT leaving', ps)
             S['step'] = 'quit'
     elif step == 'quit':
         log('done')

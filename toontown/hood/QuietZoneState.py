@@ -83,7 +83,11 @@ class QuietZoneState(StateData.StateData):
         return
 
     def _start(self, requestStatus):
-        base.transitions.fadeScreen(1.0)
+        # Walking through a shop door there is nothing to hide: the room
+        # is already standing behind it.
+        from toontown.building import OpenInteriors
+        if not OpenInteriors.handingOver:
+            base.transitions.fadeScreen(1.0)
         self.fsm.request('waitForQuietZoneResponse')
 
     def getRequestStatus(self):
