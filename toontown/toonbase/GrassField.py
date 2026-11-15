@@ -52,9 +52,9 @@ WIND_STRENGTH = 0.50
 #
 # A third of the blades last beyond FADE_MID.  Past LOD_SWITCH a block draws
 # only those (a lighter mesh of the very same blades, so nothing changes).
-FADE_NEAR = 40.0
-FADE_MID = 90.0
-FADE_FAR = 190.0
+FADE_NEAR = 65.0
+FADE_MID = 135.0
+FADE_FAR = 270.0
 KEEP_FRACTION = 1.0 / 3.0
 BLOCK_SIZE = 24.0
 LOD_SWITCH = FADE_MID + BLOCK_SIZE * 0.75

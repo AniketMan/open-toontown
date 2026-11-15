@@ -85,7 +85,13 @@ class LocalAvatar(DistributedAvatar.DistributedAvatar, DistributedSmoothNode.Dis
         self.cTrav.setRespectPrevTransform(1)
         self.avatarControlsEnabled = 0
         self.controlManager = WASDControlManager(True, passMessagesThrough)
-        self.accept('chatInputActive', self.controlManager.setTyping)
+        # Hold shift to sprint.
+        self.sprinting = False
+        self.walkSpeedMode = 'normal'
+        self.sprintTyping = False
+        self.accept('chatInputActive', self.__sprintTyping)
+        if ConfigVariableBool('want-sprint', True).value:
+            taskMgr.add(self.__watchSprint, 'localAvatar-sprint-watch')
         self.initializeCollisions()
         self.initializeSmartCamera()
         self.cameraPositions = []
@@ -169,6 +175,7 @@ class LocalAvatar(DistributedAvatar.DistributedAvatar, DistributedSmoothNode.Dis
             return
         except:
             self.LocalAvatar_deleted = 1
+        taskMgr.remove('localAvatar-sprint-watch')
 
         self.ignoreAll()
         self.stopJumpLandTask()
@@ -467,9 +474,37 @@ class LocalAvatar(DistributedAvatar.DistributedAvatar, DistributedSmoothNode.Dis
         self.clearPageUpDown()
 
     def setWalkSpeedNormal(self):
-        self.controlManager.setSpeeds(OTPGlobals.ToonForwardSpeed, OTPGlobals.ToonJumpForce, OTPGlobals.ToonReverseSpeed, OTPGlobals.ToonRotateSpeed)
+        self.walkSpeedMode = 'normal'
+        factor = self.SprintFactor if getattr(self, 'sprinting', False) else 1.0
+        self.controlManager.setSpeeds(OTPGlobals.ToonForwardSpeed * factor, OTPGlobals.ToonJumpForce, OTPGlobals.ToonReverseSpeed * factor, OTPGlobals.ToonRotateSpeed)
+
+    SprintFactor = ConfigVariableDouble('sprint-speed-factor', 1.6).value
+
+    def __sprintTyping(self, typing):
+        self.sprintTyping = bool(typing)
+        self.controlManager.setTyping(typing)
+
+    def __watchSprint(self, task):
+        """Shift held: run faster.  Only where the toon walks about freely
+        (a street, a playground, a room), never while typing, slowed down,
+        or in an activity that sets its own speeds."""
+        watcher = base.mouseWatcherNode
+        want = bool(watcher is not None and watcher.isButtonDown(KeyboardButton.shift())
+                    and not self.sprintTyping)
+        if want:
+            playGame = getattr(base.cr, 'playGame', None)
+            place = playGame.getPlace() if playGame is not None else None
+            fsm = getattr(place, 'fsm', None)
+            state = fsm.getCurrentState().getName() if fsm is not None and fsm.getCurrentState() is not None else None
+            want = state == 'walk'
+        if want != self.sprinting:
+            self.sprinting = want
+            if self.walkSpeedMode == 'normal':
+                self.setWalkSpeedNormal()
+        return task.cont
 
     def setWalkSpeedSlow(self):
+        self.walkSpeedMode = 'slow'
         self.controlManager.setSpeeds(OTPGlobals.ToonForwardSlowSpeed, OTPGlobals.ToonJumpSlowForce, OTPGlobals.ToonReverseSlowSpeed, OTPGlobals.ToonRotateSlowSpeed)
 
     def pageUp(self):

@@ -183,6 +183,25 @@ HD_SLOTS = {'f': '01_Flunky_Bossbot', 'p': '02_Pencil-Pusher_Bossbot', 'ym': '03
  'gh': '28_Glad-Hander_Sellbot', 'ms': '29_Mover-Shaker_Sellbot', 'tf': '30_Two-Face_Sellbot',
  'm': '31_The-Mingler_Sellbot', 'mh': '32_Mr-Hollywood_Sellbot'}
 _hdModelPaths = {}
+_flatColorTextures = {}
+
+
+def flatColorTexture(color):
+    """A one-pixel texture of this colour."""
+    key = (round(color[0], 3), round(color[1], 3), round(color[2], 3))
+    if key not in _flatColorTextures:
+        image = PNMImage(1, 1)
+        image.fill(*key)
+        tex = Texture('flat-%s-%s-%s' % key)
+        tex.load(image)
+        _flatColorTextures[key] = tex
+    return _flatColorTextures[key]
+
+# Where the glowing health emblem sits on an HD model's chest joint.
+# Last frame of the defeat animation before its pieces fly apart (24 a second;
+# the explosion is at 5.4 seconds).
+HD_LOSE_LAST_FRAME = 134
+HD_EMBLEM_POS_HPR_SCALE = (0.02, 0.05, 0.04, 180.0, 0.0, 0.0, 0.51, 0.51, 0.51)
 
 
 def hdModelPath(dnaName):
@@ -804,7 +823,13 @@ class Suit(Avatar.Avatar):
 
     def generateHead(self, headType):
         if self.hdModel:
-            return  # the head is part of the HD model
+            # The head is part of the HD model.  Battle effects (the stun
+            # stars of a pie hit, for one) still attach themselves to the
+            # first head part, so give them an empty node on the head joint.
+            joint = self.find('**/joint_head')
+            anchor = (joint if not joint.isEmpty() else self).attachNewNode('hd-head-anchor')
+            self.headParts.append(anchor)
+            return
         if ConfigVariableBool('want-new-cogs', 0).value:
             filePrefix, phase = HeadModelDict[self.style.body]
         else:
@@ -875,25 +900,55 @@ class Suit(Avatar.Avatar):
 
     def generateHealthBar(self):
         self.removeHealthBar()
-        model = loader.loadModel('phase_3.5/models/gui/matching_game_gui')
-        button = model.find('**/minnieCircle')
-        button.setScale(3.0)
-        button.setH(180.0)
+        self.hdEmblem = None
+        if self.hdModel:
+            # The health light of an HD model is its own department emblem,
+            # lit up in the colour of its health while it is in a battle
+            # (setHealthLight).  The node made here only carries the halo.
+            emblem = self.find('**/hd_emblem')
+            if not emblem.isEmpty():
+                self.hdEmblem = emblem
+                button = hidden.attachNewNode('hd-health-light')
+            else:
+                # An HD model without an emblem of its own gets the flat icon.
+                icons = loader.loadModel('phase_3/models/gui/cog_icons')
+                name = {'c': 'CorpIcon', 's': 'SalesIcon', 'l': 'LegalIcon', 'm': 'MoneyIcon'}[self.style.dept]
+                button = icons.find('**/' + name).copyTo(hidden)
+                icons.removeNode()
+            # HD models mark where the light sits, on the face of their
+            # medallion (hd_meter); older exports only have the chest joint.
+            self.hdMeterSeat = self.find('**/hd_meter')
+            if self.hdMeterSeat.isEmpty():
+                button.setPosHprScale(*HD_EMBLEM_POS_HPR_SCALE)
+        else:
+            model = loader.loadModel('phase_3.5/models/gui/matching_game_gui')
+            button = model.find('**/minnieCircle')
+            button.setScale(3.0)
+            button.setH(180.0)
         button.setColor(self.healthColors[0])
+        # Its own light: not dimmed by shade or shadow (see PostFX).
+        button.setTag('postfx-glow', '1')
         if ConfigVariableBool('want-new-cogs', 0).value:
             chestNull = self.find('**/def_joint_attachMeter')
             if chestNull.isEmpty():
                 chestNull = self.find('**/joint_attachMeter')
         else:
             chestNull = self.find('**/joint_attachMeter')
-        button.reparentTo(chestNull)
+        seat = getattr(self, 'hdMeterSeat', None) if self.hdModel else None
+        seated = seat is not None and not seat.isEmpty()
+        button.reparentTo(seat if seated else chestNull)
         self.healthBar = button
         glow = BattleProps.globalPropPool.getProp('glow')
         glow.reparentTo(self.healthBar)
-        glow.setScale(0.28)
-        glow.setPos(-0.005, 0.01, 0.015)
+        if self.hdModel:
+            glow.setScale(0.55 if seated else 0.28 / HD_EMBLEM_POS_HPR_SCALE[-1])
+            glow.setPos(0, 0.02, 0)
+        else:
+            glow.setScale(0.28)
+            glow.setPos(-0.005, 0.01, 0.015)
         glow.setColor(self.healthGlowColors[0])
-        button.flattenLight()
+        if not self.hdModel:
+            button.flattenLight()
         self.healthBarGlow = glow
         self.healthBar.hide()
         self.healthCondition = 0
@@ -928,13 +983,38 @@ class Suit(Avatar.Avatar):
                 blinkTask = Task.loop(Task(self.__blinkRed), Task.pause(0.25), Task(self.__blinkGray), Task.pause(0.1))
                 taskMgr.add(blinkTask, self.uniqueName('blink-task'))
             else:
-                self.healthBar.setColor(self.healthColors[condition], 1)
-                self.healthBarGlow.setColor(self.healthGlowColors[condition], 1)
+                self.setHealthColor(self.healthColors[condition], self.healthGlowColors[condition])
             self.healthCondition = condition
 
+    def setHealthColor(self, color, glowColor):
+        self.healthColor = color
+        self.healthBar.setColor(color, 1)
+        self.healthBarGlow.setColor(glowColor, 1)
+        if getattr(self, 'hdEmblem', None) is not None and getattr(self, 'healthLightOn', False):
+            self.hdEmblem.setTexture(flatColorTexture(color), 1)
+
+    def setHealthLight(self, on):
+        """Lights an HD model's emblem in its health colour, or returns it
+        to plain metal.  A lit emblem is its own light: it is not dimmed
+        by shade or shadow (see the glow flag in PostFX)."""
+        self.healthLightOn = on
+        emblem = getattr(self, 'hdEmblem', None)
+        if emblem is None or emblem.isEmpty():
+            return
+        if on:
+            # Coloured with a one-pixel texture, not a flat colour: a flat
+            # colour makes Panda rebuild the emblem's vertices without their
+            # skinning, and it is left hanging in the rest pose in front of
+            # the medallion while the body moves.
+            if not hasattr(self, 'hdEmblemState'):
+                self.hdEmblemState = emblem.getState()
+            emblem.setTexture(flatColorTexture(getattr(self, 'healthColor', self.healthColors[0])), 1)
+            emblem.setShaderInput('geomFlags', Vec4(0, 1, 0, 0), 100)
+        elif hasattr(self, 'hdEmblemState'):
+            emblem.setState(self.hdEmblemState)
+
     def __blinkRed(self, task):
-        self.healthBar.setColor(self.healthColors[3], 1)
-        self.healthBarGlow.setColor(self.healthGlowColors[3], 1)
+        self.setHealthColor(self.healthColors[3], self.healthGlowColors[3])
         if self.healthCondition == 5:
             self.healthBar.setScale(1.17)
         return Task.done
@@ -942,8 +1022,7 @@ class Suit(Avatar.Avatar):
     def __blinkGray(self, task):
         if not self.healthBar:
             return
-        self.healthBar.setColor(self.healthColors[4], 1)
-        self.healthBarGlow.setColor(self.healthGlowColors[4], 1)
+        self.setHealthColor(self.healthColors[4], self.healthGlowColors[4])
         if self.healthCondition == 5:
             self.healthBar.setScale(1.0)
         return Task.done
@@ -952,6 +1031,8 @@ class Suit(Avatar.Avatar):
         if self.healthBar:
             self.healthBar.removeNode()
             self.healthBar = None
+        if getattr(self, 'hdEmblem', None) is not None:
+            self.setHealthLight(False)
         if self.healthCondition == 4 or self.healthCondition == 5:
             taskMgr.remove(self.uniqueName('blink-task'))
         self.healthCondition = 0
@@ -962,7 +1043,26 @@ class Suit(Avatar.Avatar):
             if self.find('**/body'):
                 return self
         if self.loseActor == None:
-            if not self.isSkeleton:
+            if self.hdModel and not self.isSkeleton:
+                # The HD model plays its own defeat: the explosion animation
+                # was made for a cut-down copy of the same skeleton, and
+                # binds to this one by joint name.  Head and clothes are
+                # part of the model.
+                filePrefix, phase = TutorialModelDict[self.style.body]
+                loseAnim = 'phase_' + str(phase) + filePrefix + 'lose'
+                self.loseActor = Actor.Actor(hdModelPath(self.style.name))
+                # The animation calls the skeleton's root by another name
+                # (suitC_lose for suitC); it only binds if the names agree.
+                skeleton = self.loseActor.getPartBundle('modelRoot').findChild('<skeleton>')
+                if skeleton is not None and skeleton.getNumChildren() == 1:
+                    root = skeleton.getChild(0)
+                    if not root.getName().endswith('_lose'):
+                        root.setName(root.getName() + '_lose')
+                self.loseActor.loadAnims({'lose': loseAnim})
+                self.followHips(self.loseActor, 'lose')
+                if self.loseActor.find('**/joint_shadow').isEmpty():
+                    self.loseActor.exposeJoint(None, 'modelRoot', 'joint_shadow')
+            elif not self.isSkeleton:
                 filePrefix, phase = TutorialModelDict[self.style.body]
                 loseModel = 'phase_' + str(phase) + filePrefix + 'lose-mod'
                 loseAnim = 'phase_' + str(phase) + filePrefix + 'lose'
@@ -991,7 +1091,85 @@ class Suit(Avatar.Avatar):
         dropShadow.reparentTo(shadowJoint)
         return self.loseActor
 
+    def followHips(self, actor, animName):
+        """The defeat animation was made for a skeleton without some of
+        the joints an HD model's coat hangs from.  Left alone they stay
+        where they stood while the body moves away, and the coat stretches
+        out to them.  They are carried along rigidly with the hips."""
+        bundle = actor.getPartBundle('modelRoot')
+        skeleton = bundle.findChild('<skeleton>')
+        control = actor.getAnimControl(animName)
+        if skeleton is None or skeleton.getNumChildren() != 1 or control is None:
+            return
+        root = skeleton.getChild(0)
+        animSkeleton = control.getAnim().findChild('<skeleton>')
+        if animSkeleton is None or animSkeleton.getNumChildren() != 1:
+            return
+        animRoot = animSkeleton.getChild(0)
+        driven = set(animRoot.getChild(i).getName() for i in range(animRoot.getNumChildren()))
+        if 'to_MAIN' not in driven:
+            return
+        rest = {}
+        for i in range(root.getNumChildren()):
+            joint = root.getChild(i)
+            if isinstance(joint, CharacterJoint):
+                rest[joint.getName()] = LMatrix4(joint.getDefaultValue())
+        hipsRest = LMatrix4()
+        hipsRest.invertFrom(rest['to_MAIN'])
+        followers = []
+        for name, mat in rest.items():
+            if name in driven or name.startswith('joint_'):
+                continue
+            node = actor.controlJoint(None, 'modelRoot', name)
+            followers.append((node, mat * hipsRest))
+        # Deeper joints the animation has no place for (it keeps the right
+        # thumb under a joint HD models don't have) get bound to the wrong
+        # channel and fly off; hold them in their rest pose instead.
+        def paths(group, prefix, out):
+            for i in range(group.getNumChildren()):
+                child = group.getChild(i)
+                out[child.getName()] = prefix
+                paths(child, prefix + '/' + child.getName(), out)
+            return out
+        animPaths = paths(animRoot, '', {})
+
+        def hold(joint, prefix, top):
+            for i in range(joint.getNumChildren()):
+                child = joint.getChild(i)
+                name = child.getName()
+                if not isinstance(child, CharacterJoint):
+                    continue
+                if not top and animPaths.get(name) != prefix:
+                    actor.controlJoint(None, 'modelRoot', name).setMat(LMatrix4(child.getDefaultValue()))
+                hold(child, prefix + '/' + name, False)
+        hold(root, '', True)
+        hips = actor.exposeJoint(None, 'modelRoot', 'to_MAIN')
+        rootNode = actor.exposeJoint(None, 'modelRoot', root.getName())
+
+        def follow(task):
+            if actor.isEmpty() or hips.isEmpty():
+                return task.done
+            now = hips.getMat(rootNode)
+            for node, offset in followers:
+                node.setMat(offset * now)
+            # From here the animation throws the pieces of the old model
+            # apart, which would pull a one-piece model into sheets.  The
+            # explosion goes off at this moment and covers the exit.
+            flying = control.getFrame() >= HD_LOSE_LAST_FRAME
+            if flying != actor.isHidden():
+                if flying:
+                    actor.hide()
+                else:
+                    actor.show()
+            return task.cont
+
+        self.followHipsTask = taskMgr.add(follow, self.uniqueName('hd-lose-follow') if hasattr(self, 'uniqueName') else 'hd-lose-follow-%d' % id(self), sort=30)
+
     def cleanupLoseActor(self):
+        task = getattr(self, 'followHipsTask', None)
+        if task is not None:
+            taskMgr.remove(task)
+            self.followHipsTask = None
         self.notify.debug('cleanupLoseActor()')
         if self.loseActor != None:
             self.notify.debug('cleanupLoseActor() - got one')

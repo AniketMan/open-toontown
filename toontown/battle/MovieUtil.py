@@ -200,6 +200,8 @@ def removeReviveSuit(suit, deathSuit):
         deathSuit.detachNode()
         suit.cleanupLoseActor()
     suit.healthBar.show()
+    if hasattr(suit, 'setHealthLight'):
+        suit.setHealthLight(True)
     suit.reseatHealthBarForSkele()
 
 

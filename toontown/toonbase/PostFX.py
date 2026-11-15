@@ -41,6 +41,7 @@ from panda3d.core import (ConfigVariableBool, ConfigVariableString, Shader,
 import re
 
 BLOB_SHADOW = re.compile(r'drop.?shadow', re.I)
+NOT_BACKDROP = re.compile(r'fence|tree|water|grass|window|door|sign', re.I)
 MATERIAL_CAMERA_BITMASK = BitMask32.bit(7)
 from otp.otpbase import OTPRender
 from toontown.toonbase import MaterialLibrary
@@ -187,7 +188,7 @@ uniform sampler2D p3d_Texture0;
 uniform sampler2D matNormal;
 uniform vec4 matParams;     // repeats per world unit, grain strength, 1/texture width, 1/texture height
 uniform vec4 shapeParams;   // shape strength, gap sensitivity, unused, unused
-uniform vec4 geomFlags;     // 1 if the geometry carries smooth vertex normals
+uniform vec4 geomFlags;     // x: 1 if the geometry carries smooth vertex normals; y: 1 if it glows; z: 1 for a painted backdrop
 uniform vec3 lightDirWorld; // light used for relief
 uniform mat4 worldToView;
 varying vec3 vView;
@@ -197,6 +198,12 @@ varying vec2 vUv;
 void main() {
     // Cut-out art (leaves, fences) only counts where it is opaque.
     if (texture2D(p3d_Texture0, vUv).a < 0.5) discard;
+    // Things that give off light of their own (tagged postfx-glow) are
+    // marked with a value no normal can have, and are not lit or shaded.
+    if (geomFlags.y > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+    // Painted backdrops (far hills on see-through cards) are marked too:
+    // they take the light of the day but no shadows or shading.
+    if (geomFlags.z > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 0.5); return; }
     // Surfaces with nothing to add still have to hide what is behind them.
     if (matParams.y <= 0.0 && geomFlags.x < 0.5) { gl_FragColor = vec4(0.5, 0.5, 0.5, 0.0); return; }
     // Flat world-space normal of this triangle, facing the camera.
@@ -274,11 +281,14 @@ varying vec2 uv;
 uniform sampler2D sceneTex;
 uniform sampler2D aoTex;
 uniform sampler2D shadowTex;
+uniform sampler2D shadowTexFar;   // a second, wider map for everything further off
 uniform sampler2D materialTex;
 uniform vec3 lightDirView;  // light used for surface relief (the sun outdoors)
 uniform float reliefStrength;
 uniform vec4 mix4;          // ao on, grade on, debug view (1 ao, 2 sun), unused
 uniform mat4 shadowMat;     // Panda camera space -> shadow clip space
+uniform mat4 shadowMatFar;
+uniform vec4 shadowFar;     // max distance (0 = no far map), texel (uv), unused, unused
 uniform vec3 sunDirView;    // direction to the sun in (right, up, depth) space
 uniform vec4 shadowParams;  // strength, shadow texel (uv), max distance, form strength
 uniform vec4 hazeColor;     // colour of the air, strongest amount (0 = off)
@@ -313,32 +323,61 @@ vec3 viewNormal(vec3 P, out float ndl) {
 }
 // 1 = fully lit by the sun, 0 = fully shadowed.
 float sunLight(vec3 P, vec3 N, float ndl) {
-    // Surfaces turned away from the sun get soft form shading.
-    // Everything fades out with distance so far scenery and painted
-    // backdrops keep their original look.
-    float far = smoothstep(shadowParams.z * 0.75, shadowParams.z, P.z);
+    // Shadows come from two maps: a sharp one around the player and a
+    // wide one beyond it, so a shadow is already there when it comes
+    // into view rather than fading in as the player walks up to it.
+    // Form shading and shadows reach as far as the wide map does, so
+    // nothing is seen changing as the player walks up to it.  (Painted
+    // backdrops are kept out of this altogether: see `painted` in main.)
+    float limit = max(shadowParams.z, shadowFar.x);
+    float far = smoothstep(limit * 0.80, limit, P.z);
+    float nearFade = smoothstep(shadowParams.z * 0.75, shadowParams.z, P.z);
     float form = mix(1.0, smoothstep(-0.10, 0.30, ndl), shadowParams.w * (1.0 - far));
+    float grazing = 1.0 - clamp(ndl, 0.0, 1.0);
+    float a = ign(gl_FragCoord.xy) * 6.2831853;
     // Push the lookup off the surface along its normal, more at grazing
     // sun angles and with distance, to avoid self-shadowing.
-    vec3 Q = P + N * (0.05 + 0.25 * (1.0 - clamp(ndl, 0.0, 1.0)) + 0.003 * P.z);
+    vec3 Q = P + N * (0.05 + 0.25 * grazing + 0.003 * P.z);
     vec4 clip = shadowMat * vec4(Q.x, Q.z, Q.y, 1.0);
     vec3 sc = clip.xyz / clip.w * 0.5 + 0.5;
-    if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0 || sc.z > 1.0)
-        return form;
-    float a = ign(gl_FragCoord.xy) * 6.2831853;
-    float lit = 0.0;
-    const int TAPS = 12;
-    for (int i = 0; i < TAPS; i++) {
-        float t = (float(i) + 0.5) / float(TAPS);
-        float b = a + t * 6.2831853 * 2.618;
-        vec2 o = vec2(cos(b), sin(b)) * sqrt(t) * shadowParams.y * 2.5;
-        lit += step(sc.z - 0.0006, texture2D(shadowTex, sc.xy + o).r);
-    }
-    lit /= float(TAPS);
-    // Fade out at the edge of the shadow map too.
     vec2 e = abs(sc.xy - 0.5) * 2.0;
-    float fade = max(smoothstep(0.85, 1.0, max(e.x, e.y)), far);
-    return min(form, mix(lit, 1.0, fade));
+    float nearW = 0.0;
+    if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0)
+        nearW = (1.0 - smoothstep(0.85, 1.0, max(e.x, e.y)))
+              * (1.0 - nearFade);
+    float litNear = 1.0;
+    if (nearW > 0.0) {
+        litNear = 0.0;
+        const int TAPS = 12;
+        for (int i = 0; i < TAPS; i++) {
+            float t = (float(i) + 0.5) / float(TAPS);
+            float b = a + t * 6.2831853 * 2.618;
+            vec2 o = vec2(cos(b), sin(b)) * sqrt(t) * shadowParams.y * 2.5;
+            litNear += step(sc.z - 0.0006, texture2D(shadowTex, sc.xy + o).r);
+        }
+        litNear /= float(TAPS);
+    }
+    float litFar = 1.0;
+    if (shadowFar.x > 0.0 && nearW < 1.0) {
+        vec3 Q2 = P + N * (0.35 + 0.9 * grazing + 0.004 * P.z);
+        vec4 clip2 = shadowMatFar * vec4(Q2.x, Q2.z, Q2.y, 1.0);
+        vec3 s2 = clip2.xyz / clip2.w * 0.5 + 0.5;
+        if (s2.x > 0.0 && s2.x < 1.0 && s2.y > 0.0 && s2.y < 1.0 && s2.z < 1.0) {
+            vec2 e2 = abs(s2.xy - 0.5) * 2.0;
+            float lit = 0.0;
+            const int FAR_TAPS = 8;
+            for (int i = 0; i < FAR_TAPS; i++) {
+                float t = (float(i) + 0.5) / float(FAR_TAPS);
+                float b = a + t * 6.2831853 * 2.618;
+                vec2 o = vec2(cos(b), sin(b)) * sqrt(t) * shadowFar.y * 1.6;
+                lit += step(s2.z - 0.0005, texture2D(shadowTexFar, s2.xy + o).r);
+            }
+            lit /= float(FAR_TAPS);
+            float w = (1.0 - smoothstep(0.90, 1.0, max(e2.x, e2.y))) * (1.0 - far);
+            litFar = mix(1.0, lit, w);
+        }
+    }
+    return min(form, mix(litFar, litNear, nearW));
 }
 void main() {
     vec3 c = texture2D(sceneTex, uv).rgb;
@@ -347,11 +386,17 @@ void main() {
     vec3 P = viewPos(uv);
     vec4 mat = texture2D(materialTex, uv);
     vec3 N = vec3(0.0, 0.0, -1.0);
-    if (shadowParams.x > 0.0 && P.z < lensInfo.y * 0.97) {
+    // Two marks the material pass leaves in place of a normal: a light
+    // of its own, and a painted backdrop.
+    bool marked = mat.a > 0.4 && dot(mat.rgb, mat.rgb) < 0.03;
+    bool glows = marked && mat.a > 0.75;
+    bool painted = marked && !glows;
+    bool shaped = mat.a > 0.05 && !marked;
+    if (shadowParams.x > 0.0 && P.z < lensInfo.y * 0.97 && !painted) {
         float ndl;
         N = viewNormal(P, ndl);
         // The material pass knows the smooth / normal-mapped normal.
-        if (mat.a > 0.05) {
+        if (shaped) {
             N = normalize(mat.rgb * 2.0 - 1.0);
             ndl = dot(N, sunDirView);
         }
@@ -360,9 +405,9 @@ void main() {
     // Surface relief from the material pass: where the normal map tilts
     // the surface toward the light it brightens, away it darkens.
     float relief = 0.0;
-    if (mat.a > 0.05) {
+    if (shaped) {
         relief = ((mat.a - 0.1) / 0.9 * 2.0 - 1.0) * reliefStrength;
-        relief *= 1.0 - smoothstep(60.0, 140.0, P.z);     // too fine to see far away
+        relief *= 1.0 - smoothstep(110.0, 230.0, P.z);    // too fine to see far away
         relief *= 0.45 + 0.55 * sun;                      // weaker in shadow
     }
     // The game's art is painted at full brightness.  Here it is treated
@@ -371,7 +416,11 @@ void main() {
     // that light actually reaches.  Take the key away and the scene is
     // left in its ambient shade.
     float direct = 1.0 - shadowParams.x * (1.0 - sun);
-    if (lightAmbient.a > 0.5 && P.z < lensInfo.y * 0.97) {
+    // A light of its own: shown at full strength wherever it is.
+    if (glows) {
+        relief = 0.0;
+        c = min(c * 1.35 + 0.06, vec3(1.0));
+    } else if (lightAmbient.a > 0.5 && P.z < lensInfo.y * 0.97) {
         vec3 key = lightKey.rgb;
         if (indoor.x > 0.5) {
             // The room's own lights: a ceiling fitting, each lamp that
@@ -379,7 +428,7 @@ void main() {
             // it and is near it, and fades with distance.
             // Rounded characters carry a smooth normal in the material
             // pass; without it their flat polygons would show as facets.
-            vec3 Ns = mat.a > 0.05 ? normalize(mat.rgb * 2.0 - 1.0) : N;
+            vec3 Ns = shaped ? normalize(mat.rgb * 2.0 - 1.0) : N;
             vec3 sum = vec3(0.0);
             for (int i = 0; i < 8; i++) {
                 if (lampCol[i].a < 0.5) continue;
@@ -480,7 +529,11 @@ class PostFX(DirectObject):
     AO_INTENSITY = 2.6
     AO_MAX_DIST = 220.0
     SUN_DIRECTION = Vec3(0.45, 0.55, -0.70)   # direction the sunlight travels
-    SHADOW_EXTENT = 160.0  # width of the area around the player that gets shadows
+    SHADOW_EXTENT = 300.0  # width of the area around the player that gets sharp shadows
+    # A second, coarser map covers everything out to the haze, so shadows
+    # are already there when they come into view.
+    SHADOW_FAR_EXTENT = 1100.0
+    SHADOW_FAR_DISTANCE = 560.0
     SHADOW_STRENGTH = 0.96 # how completely a cast shadow blocks the key light
     # Light levels.  Ambient + key is a little over 1, so a surface in
     # full light looks as the artists painted it; in shade only the
@@ -538,6 +591,7 @@ class PostFX(DirectObject):
         self.wantGrade = ConfigVariableBool('postfx-grade', True).value
         self.wantShadows = ConfigVariableBool('postfx-shadows', True).value
         self.shadowSize = ConfigVariableInt('postfx-shadow-size', 4096).value
+        self.wantFarShadows = ConfigVariableBool('postfx-far-shadows', True).value
         self.wantMaterials = ConfigVariableBool('postfx-materials', True).value
         self.wantSmooth = ConfigVariableBool('postfx-smooth-characters', True).value
         self.wantGrass = ConfigVariableBool('postfx-grass', True).value
@@ -714,6 +768,11 @@ class PostFX(DirectObject):
         self.shadowTex = self._tex('postfx-shadow', linear=False)
         quad.setShaderInput('shadowTex', self.shadowTex)
         quad.setShaderInput('shadowMat', LMatrix4.identMat())
+        self.shadowTexFar = self._tex('postfx-shadow-far', linear=False)
+        quad.setShaderInput('shadowTexFar', self.shadowTexFar)
+        quad.setShaderInput('shadowMatFar', LMatrix4.identMat())
+        quad.setShaderInput('shadowFar', Vec4(0, 0, 0, 0))
+        self.shadowBufferFar = None
         quad.setShaderInput('sunDirView', Vec3(0, 1, 0))
         quad.setShaderInput('shadowParams', Vec4(0, 0, 0, 0))
         quad.setShaderInput('hazeColor', Vec4(0, 0, 0, 0))
@@ -781,10 +840,42 @@ class PostFX(DirectObject):
         buf.makeDisplayRegion().setCamera(self.shadowCam)
         buf.setActive(False)
 
+        # The wide map: same light, same rules, a bigger piece of ground.
+        if not self.wantFarShadows:
+            return
+        farBuf = base.graphicsEngine.makeOutput(
+            base.pipe, 'postfx-shadow-far', -99, fbp, WindowProperties.size(size, size),
+            GraphicsPipe.BFRefuseWindow, base.win.getGsg(), base.win)
+        if farBuf is None:
+            self.notify.warning('Could not create the far shadow buffer.')
+            return
+        farBuf.addRenderTexture(self.shadowTexFar, GraphicsOutput.RTMBindOrCopy,
+                                GraphicsOutput.RTPDepth)
+        farLens = OrthographicLens()
+        farLens.setFilmSize(self.SHADOW_FAR_EXTENT, self.SHADOW_FAR_EXTENT)
+        farLens.setNearFar(10.0, 2200.0)
+        farCam = Camera('postfx-shadow-far-cam')
+        farCam.setLens(farLens)
+        farCam.setScene(base.render)
+        farCam.setCameraMask(OTPRender.ShadowCameraBitmask)
+        farCam.setLodCenter(base.cam)
+        farCam.setInitialState(state)
+        farCam.setTagStateKey('sky')
+        for value in ('Regular', 'Halloween'):
+            farCam.setTagState(value, noDraw)
+        self.shadowLensFar = farLens
+        self.shadowCamFar = self.sunRoot.attachNewNode(farCam)
+        farBuf.makeDisplayRegion().setCamera(self.shadowCamFar)
+        farBuf.setActive(False)
+        self.shadowBufferFar = farBuf
+
     def _cleanupShadows(self):
         if self.shadowBuffer is not None:
             self.base.graphicsEngine.removeWindow(self.shadowBuffer)
             self.shadowBuffer = None
+            if self.shadowBufferFar is not None:
+                self.base.graphicsEngine.removeWindow(self.shadowBufferFar)
+                self.shadowBufferFar = None
             self.shadowCam.removeNode()
             self.sunRoot.removeNode()
         self.sunOn = False
@@ -921,6 +1012,16 @@ class PostFX(DirectObject):
                 texAttrib = net.compose(geomState).getAttrib(TextureAttrib)
                 if texAttrib is not None and not texAttrib.isOff() and texAttrib.getNumOnStages() > 0:
                     tex = texAttrib.getTexture()
+                if np.hasNetTag('postfx-glow'):
+                    attrib = ShaderAttrib.make().setShaderInput('geomFlags', Vec4(0, 1, 0, 0))
+                    node.setGeomState(i, geomState.setAttrib(attrib))
+                    bound += 1
+                    continue
+                if self._isBackdrop(np, net.compose(geomState)):
+                    attrib = ShaderAttrib.make().setShaderInput('geomFlags', Vec4(0, 0, 1, 0))
+                    node.setGeomState(i, geomState.setAttrib(attrib))
+                    bound += 1
+                    continue
                 entry = None
                 if (self.grass is not None and self.sunOn and not np.hasTag('postfx-grass-done')
                         and self.grass.wantsSurface(np, tex)):
@@ -949,6 +1050,23 @@ class PostFX(DirectObject):
             if grassed:
                 np.setTag('postfx-grass-done', '1')
         return bound
+
+    @staticmethod
+    def _isBackdrop(np, state):
+        """A painting of far scenery: a big, tall, see-through card."""
+        trans = state.getAttrib(TransparencyAttrib)
+        if trans is None or trans.getMode() == TransparencyAttrib.MNone:
+            return False
+        if np.hasPythonTag('postfx-backdrop'):
+            return np.getPythonTag('postfx-backdrop')
+        result = False
+        if not NOT_BACKDROP.search(np.getName()):
+            bounds = np.getTightBounds()
+            if bounds:
+                size = bounds[1] - bounds[0]
+                result = size[2] >= 12.0 and (max(size[0], size[1]) >= 80.0 or size[2] >= 40.0)
+        np.setPythonTag('postfx-backdrop', result)
+        return result
 
     @staticmethod
     def _isCharacter(np):
@@ -1224,6 +1342,10 @@ class PostFX(DirectObject):
             self.sunOn = outdoors
             self.indoorOn = indoors
             self.shadowBuffer.setActive(outdoors or indoors)
+            if self.shadowBufferFar is not None:
+                self.shadowBufferFar.setActive(outdoors)
+                if not outdoors:
+                    self.compositeQuad.setShaderInput('shadowFar', Vec4(0, 0, 0, 0))
             # The ceiling light looks down through the roof: rooms are
             # modelled facing inward, so from above the ceiling and the
             # near walls are back faces and never drawn.
@@ -1272,6 +1394,16 @@ class PostFX(DirectObject):
         toSun.normalize()
         quad = self.compositeQuad
         quad.setShaderInput('shadowMat', mat)
+        if self.shadowBufferFar is not None and not indoors:
+            # Centred on the camera: it turns too slowly to matter, and
+            # moves only in whole texels so its shadows don't shimmer.
+            local = self.sunRoot.getRelativePoint(render, cam.getPos(render))
+            texel = self.SHADOW_FAR_EXTENT / self.shadowSize
+            self.shadowCamFar.setPos(round(local[0] / texel) * texel, local[1] - 1100.0,
+                                     round(local[2] / texel) * texel)
+            quad.setShaderInput('shadowMatFar', cam.getMat(render) * render.getMat(self.shadowCamFar) *
+                                self.shadowLensFar.getProjectionMat())
+            quad.setShaderInput('shadowFar', Vec4(self.SHADOW_FAR_DISTANCE, 1.0 / self.shadowSize, 0, 0))
         quad.setShaderInput('sunDirView', Vec3(toSun[0], toSun[2], toSun[1]))
         if indoors:
             quad.setShaderInput('shadowParams',
