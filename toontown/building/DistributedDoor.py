@@ -36,6 +36,7 @@ from toontown.toonbase.ToonBaseGlobal import base
 from toontown.toontowngui import TTDialog
 from toontown.toontowngui.TeaserPanel import TeaserPanel
 from toontown.toonbase import FrameHold
+from toontown.building import OpenInteriors
 
 
 # Walk through doors without the iris wipe: the picture of the toon in the
@@ -100,6 +101,7 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         self.ignore('clearOutToonInterior')
         self.fsm.request('off')
         self.exitDoorFSM.request('off')
+        OpenInteriors.doorwayClosed(self)
         if 'building' in self.__dict__:
             del self.building
 
@@ -234,7 +236,8 @@ class DistributedDoor(DistributedObject, DelayDeletable):
     def getBuilding(self):
         if 'building' not in self.__dict__:
             if self.doorType == DoorTypes.INT_STANDARD:
-                door = base.render.find('**/leftDoor;+s')
+                room = OpenInteriors.roomRoot()
+                door = (room if not room.isEmpty() else base.render).find('**/leftDoor;+s')
                 self.building = door.getParent()
             elif self.doorType == DoorTypes.INT_HQ:
                 door = base.render.find('**/door_0')
@@ -283,20 +286,35 @@ class DistributedDoor(DistributedObject, DelayDeletable):
             return
         if hasattr(avatar, 'stopSmooth'):
             avatar.stopSmooth()
-        avatar.setPosHpr(otherNP, -self.doorX, -DoorSwapDepth, ToontownGlobals.FloorOffset, 180, 0, 0)
-        avatar.setParent(ToontownGlobals.SPRender)
-        avatar.setAnimState('walk')
-        base.camera.setPosHpr(otherNP, -self.doorX, DoorCamBack - DoorSwapDepth, avatar.getHeight(), 180, 0, 0)
+        if self.doorType == DoorTypes.INT_STANDARD:
+            seamless = OpenInteriors.isAligned()
+        elif self.doorType == DoorTypes.EXT_STANDARD:
+            seamless = OpenInteriors.Enabled and OpenInteriors.cameFromRoom
+            OpenInteriors.cameFromRoom = False
+        else:
+            seamless = False
+        seamless = seamless and avatar.getParent() == base.hidden
+        if seamless:
+            # The room stands behind this very door, so the toon and the
+            # camera are already where they should be: just carry on.
+            avatar.setParent(ToontownGlobals.SPRender)
+            avatar.setAnimState('walk')
+            strollTo = base.render.getRelativePoint(avatar, Point3(0, 3.0, 0))
+        else:
+            avatar.setPosHpr(otherNP, -self.doorX, -DoorSwapDepth, ToontownGlobals.FloorOffset, 180, 0, 0)
+            avatar.setParent(ToontownGlobals.SPRender)
+            avatar.setAnimState('walk')
+            base.camera.setPosHpr(otherNP, -self.doorX, DoorCamBack - DoorSwapDepth, avatar.getHeight(), 180, 0, 0)
+            strollTo = base.render.getRelativePoint(otherNP, Point3(-self.doorX, -DoorSwapDepth - 3.0, ToontownGlobals.FloorOffset))
         self.poseExitDoorOpen()
         self.hideBuildingShell()
         # Keep strolling in until the server lets the toon go.
         self.finishArrivalStroll()
-        strollTo = base.render.getRelativePoint(otherNP, Point3(-self.doorX, -DoorSwapDepth - 3.0, ToontownGlobals.FloorOffset))
         self.arrivalStroll = LerpPosInterval(nodePath=avatar, duration=1.5, pos=strollTo, name='doorArrivalStroll-%d' % self.doId)
         self.arrivalStroll.start()
         self.arrivedEarly = True
         base.transitions.noTransitions()
-        FrameHold.release(0.3)
+        FrameHold.release(0.12 if seamless else 0.3)
 
     def hideBuildingShell(self):
         """Coming out onto the street the camera starts inside the
@@ -516,7 +534,8 @@ class DistributedDoor(DistributedObject, DelayDeletable):
 
     def getDoorNodePath(self):
         if self.doorType == DoorTypes.INT_STANDARD:
-            otherNP = base.render.find('**/door_origin')
+            room = OpenInteriors.roomRoot()
+            otherNP = (room if not room.isEmpty() else base.render).find('**/door_origin')
         elif self.doorType == DoorTypes.EXT_STANDARD:
             if hasattr(self, 'tempDoorNodePath'):
                 return self.tempDoorNodePath
@@ -685,12 +704,19 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         pass
 
     def enterClosed(self, ts):
-        pass
+        if self.doorType in (DoorTypes.EXT_STANDARD, DoorTypes.INT_STANDARD):
+            OpenInteriors.doorwayClosed(self)
 
     def exitClosed(self):
         pass
 
     def enterOpening(self, ts):
+        if self.doorType == DoorTypes.EXT_STANDARD:
+            # Show the room behind this door through the doorway.
+            OpenInteriors.doorwayOpened(self)
+        elif self.doorType == DoorTypes.INT_STANDARD:
+            # ...and from inside the room, the street.
+            OpenInteriors.doorwayOpened(self, inside=True)
         doorFrameHoleRight = self.findDoorNode('doorFrameHoleRight')
         if doorFrameHoleRight.isEmpty():
             self.notify.warning('enterOpening(): did not find doorFrameHoleRight')

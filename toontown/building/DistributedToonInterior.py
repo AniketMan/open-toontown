@@ -15,6 +15,7 @@ from . import ToonInteriorColors
 from toontown.hood import ZoneUtil
 from toontown.toon import ToonDNA
 from toontown.toon import ToonHead
+from toontown.building import OpenInteriors
 SIGN_LEFT = -4
 SIGN_RIGHT = 4
 SIGN_BOTTOM = -3.5
@@ -36,6 +37,8 @@ class DistributedToonInterior(DistributedObject.DistributedObject):
         self.setup()
 
     def disable(self):
+        if OpenInteriors.alignedZone == self.zoneId:
+            OpenInteriors.alignedZone = None
         self.interior.removeNode()
         del self.interior
         DistributedObject.DistributedObject.disable(self)
@@ -63,7 +66,7 @@ class DistributedToonInterior(DistributedObject.DistributedObject):
             if key1 == 'm':
                 model = self.randomDNAItem(category, self.dnaStore.findNode)
                 newNP = model.copyTo(np)
-                c = render.findAllMatches('**/collision')
+                c = self.interior.findAllMatches('**/collision')
                 c.stash()
                 if key2 == 'r':
                     self.replaceRandomInModel(newNP)
@@ -93,7 +96,7 @@ class DistributedToonInterior(DistributedObject.DistributedObject):
         else:
             doorModelName = doorModelName[:-1] + 'r'
         door = self.dnaStore.findNode(doorModelName)
-        door_origin = render.find('**/door_origin;+s')
+        door_origin = self.interior.find('**/door_origin;+s')
         doorNP = door.copyTo(door_origin)
         door_origin.setScale(0.8, 0.8, 0.8)
         door_origin.setPos(door_origin, 0, -0.025, 0)
@@ -103,6 +106,9 @@ class DistributedToonInterior(DistributedObject.DistributedObject):
         doorFrame.wrtReparentTo(self.interior)
         doorFrame.setColor(color)
         sign = hidden.find('**/tb%s:*_landmark_*_DNARoot/**/sign;+s' % (self.block,))
+        if sign.isEmpty():
+            # the street is on screen when rooms are built in advance
+            sign = render.find('**/tb%s:*_landmark_*_DNARoot/**/sign;+s' % (self.block,))
         if not sign.isEmpty():
             signOrigin = self.interior.find('**/sign_origin;+s')
             newSignNP = sign.copyTo(signOrigin)
@@ -129,9 +135,12 @@ class DistributedToonInterior(DistributedObject.DistributedObject):
         if trophy:
             trophy.reparentTo(trophyOrigin)
         del self.colors
+        dnaStore = self.dnaStore
         del self.dnaStore
         del self.randomGenerator
         self.interior.flattenMedium()
+        # Stand the room behind the door of its own building.
+        OpenInteriors.place(self.interior, self.zoneId, self.block, dnaStore)
 
     def setZoneIdAndBlock(self, zoneId, block):
         self.zoneId = zoneId

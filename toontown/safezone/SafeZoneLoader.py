@@ -1,4 +1,5 @@
 from panda3d.core import *
+from toontown.building import OpenInteriors
 from toontown.toonbase.ToonBaseGlobal import *
 from toontown.distributed.ToontownMsgTypes import *
 from toontown.hood import ZoneUtil
@@ -44,6 +45,7 @@ class SafeZoneLoader(StateData.StateData):
     def unload(self):
         self.parentFSMState.removeChild(self.fsm)
         del self.parentFSMState
+        OpenInteriors.clearShells()
         self.geom.removeNode()
         del self.geom
         del self.fsm

@@ -1,4 +1,5 @@
 from toontown.toonbase.ToonBaseGlobal import *
+from toontown.building import OpenInteriors
 from panda3d.core import *
 from panda3d.toontown import *
 from toontown.toonbase.ToontownGlobals import *
@@ -76,7 +77,7 @@ class DistributedGagshopInterior(DistributedObject.DistributedObject):
         self.colors = ToonInteriorColors.colors[hoodId]
         self.replaceRandomInModel(self.interior)
         door = self.chooseDoor()
-        doorOrigin = render.find('**/door_origin;+s')
+        doorOrigin = self.interior.find('**/door_origin;+s')
         doorNP = door.copyTo(doorOrigin)
         doorOrigin.setScale(0.8, 0.8, 0.8)
         doorOrigin.setPos(doorOrigin, 0, -0.025, 0)
@@ -86,11 +87,16 @@ class DistributedGagshopInterior(DistributedObject.DistributedObject):
         doorFrame.wrtReparentTo(self.interior)
         doorFrame.setColor(doorColor)
         del self.colors
+        dnaStore = self.dnaStore
         del self.dnaStore
         del self.randomGenerator
         self.interior.flattenMedium()
+        # Stand the room behind the door of its own building.
+        OpenInteriors.place(self.interior, self.zoneId, self.block, dnaStore)
 
     def disable(self):
+        if OpenInteriors.alignedZone == self.zoneId:
+            OpenInteriors.alignedZone = None
         self.interior.removeNode()
         del self.interior
         DistributedObject.DistributedObject.disable(self)

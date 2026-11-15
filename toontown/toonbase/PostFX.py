@@ -176,6 +176,7 @@ varying vec3 vNormal;
 varying vec2 vUv;
 void main() {
     gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+    gl_ClipVertex = p3d_ModelViewMatrix * p3d_Vertex;   // for clip planes (OpenInteriors)
     vView = (p3d_ModelViewMatrix * p3d_Vertex).xyz;
     vWorld = (p3d_ModelMatrix * p3d_Vertex).xyz;
     vNormal = (p3d_ModelMatrix * vec4(p3d_Normal, 0.0)).xyz;
@@ -196,14 +197,16 @@ varying vec3 vWorld;
 varying vec3 vNormal;
 varying vec2 vUv;
 void main() {
+    // Painted backdrops (far hills on see-through cards) are marked, the
+    // see-through part of the card included: they take the light of the
+    // day but no shadows or shading, and a shadow falling on the clear
+    // part of a card would show its outline against the sky.
+    if (geomFlags.z > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 0.5); return; }
     // Cut-out art (leaves, fences) only counts where it is opaque.
     if (texture2D(p3d_Texture0, vUv).a < 0.5) discard;
     // Things that give off light of their own (tagged postfx-glow) are
     // marked with a value no normal can have, and are not lit or shaded.
     if (geomFlags.y > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
-    // Painted backdrops (far hills on see-through cards) are marked too:
-    // they take the light of the day but no shadows or shading.
-    if (geomFlags.z > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 0.5); return; }
     // Surfaces with nothing to add still have to hide what is behind them.
     if (matParams.y <= 0.0 && geomFlags.x < 0.5) { gl_FragColor = vec4(0.5, 0.5, 0.5, 0.0); return; }
     // Flat world-space normal of this triangle, facing the camera.
@@ -1214,7 +1217,8 @@ class PostFX(DirectObject):
         lo, hi = None, None
         for child in render.getChildren():
             # Rooms are plain model nodes; skip toons, the camera and helpers.
-            if child.isHidden() or child.isStashed() or self._isCharacter(child):
+            if (child.isHidden() or child.isStashed() or child.hasTag('postfx-outside')
+                    or self._isCharacter(child)):
                 continue
             if child.find('**/+GeomNode').isEmpty() or not child.find('**/+Camera').isEmpty():
                 continue

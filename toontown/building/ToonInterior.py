@@ -1,4 +1,5 @@
 from panda3d.core import ModelPool, TexturePool
+from toontown.building import OpenInteriors
 from panda3d.otp import NametagGlobals
 
 from direct.directnotify.DirectNotifyGlobal import directNotify
@@ -97,11 +98,14 @@ class ToonInterior(Place):
         base.playMusic(self.loader.activityMusic, looping=1, volume=volume)
         self._telemLimiter = TLGatherAllAvs('ToonInterior', RotationLimitToH)
         NametagGlobals.setMasterArrowsOn(1)
+        # The room stands behind its own door: keep the street around it.
+        OpenInteriors.enterRoom(self.loader)
         self.fsm.request(requestStatus['how'], [requestStatus])
 
     def exit(self):
         self.ignoreAll()
         messenger.send('exitToonInterior')
+        OpenInteriors.leaveRoom()
         self._telemLimiter.destroy()
         del self._telemLimiter
         NametagGlobals.setMasterArrowsOn(0)

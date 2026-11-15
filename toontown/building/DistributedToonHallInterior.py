@@ -75,7 +75,7 @@ class DistributedToonHallInterior(DistributedToonInterior):
         else:
             doorModelName = doorModelName[:-1] + 'r'
         door = self.dnaStore.findNode(doorModelName)
-        door_origin = render.find('**/door_origin;+s')
+        door_origin = self.interior.find('**/door_origin;+s')
         doorNP = door.copyTo(door_origin)
         door_origin.setScale(0.8, 0.8, 0.8)
         door_origin.setPos(door_origin, 0, -0.025, 0)

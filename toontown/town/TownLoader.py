@@ -1,4 +1,5 @@
 from panda3d.core import *
+from toontown.building import OpenInteriors
 from toontown.battle.BattleProps import *
 from toontown.battle.BattleSounds import *
 from toontown.distributed.ToontownMsgTypes import *
@@ -58,6 +59,7 @@ class TownLoader(StateData.StateData):
         self.townBattle.load()
 
     def unload(self):
+        OpenInteriors.clearShells()
         self.unloadBattleAnims()
         globalPropPool.unloadProps()
         globalBattleSoundCache.clear()

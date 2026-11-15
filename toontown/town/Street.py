@@ -1,4 +1,5 @@
 from panda3d.core import *
+from toontown.building import OpenInteriors
 from panda3d.otp import *
 from toontown.battle.BattleProps import *
 from toontown.battle.BattleSounds import *
@@ -102,6 +103,8 @@ class Street(BattlePlace.BattlePlace):
             self.visibilityOn()
         base.localAvatar.setGeom(self.loader.geom)
         base.localAvatar.setOnLevelGround(1)
+        # Build the room behind every shop door on this street.
+        OpenInteriors.prebuild(self.loader, self.loader.branchZone)
         self._telemLimiter = TLGatherAllAvs('Street', RotationLimitToH)
         NametagGlobals.setMasterArrowsOn(arrowsOn)
 

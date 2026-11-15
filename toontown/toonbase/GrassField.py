@@ -141,6 +141,8 @@ void main() {
     vec3 pos = root.xyz + blade * grow + wind * tip * tip * grow;
     pos.z -= dot(wind.xy, wind.xy) * tip * 0.6 * grow;   // bending shortens it
     gl_Position = p3d_ModelViewProjectionMatrix * vec4(pos, 1.0);
+    // lets a clip plane (OpenInteriors) cut the lawn like everything else
+    gl_ClipVertex = p3d_ModelViewMatrix * vec4(pos, 1.0);
     // A fading blade also drifts towards the colour of the lawn under it.
     vec3 lawn = p3d_ColorScale.rgb;
     // So does every blade with distance, so far blades barely stand out
@@ -183,6 +185,7 @@ varying vec2 vUv;
 varying float vDist;
 void main() {
     gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex;
+    gl_ClipVertex = p3d_ModelViewMatrix * p3d_Vertex;
     vWorld = (p3d_ModelMatrix * p3d_Vertex).xy;
     vUv = p3d_MultiTexCoord0;
     vDist = length((p3d_ModelViewMatrix * p3d_Vertex).xyz);

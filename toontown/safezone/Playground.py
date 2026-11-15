@@ -1,4 +1,5 @@
 from panda3d.core import LineSegs, NodePath, TextNode, Vec4
+from toontown.building import OpenInteriors
 from panda3d.otp import NametagGlobals
 
 from direct.directnotify.DirectNotifyGlobal import directNotify
@@ -207,6 +208,8 @@ class Playground(Place):
         self.accept('DistributedDoor_doorTrigger', self.handleDoorTrigger)
         base.playMusic(self.loader.music, looping=1, volume=0.8)
         self.loader.geom.reparentTo(base.render)
+        # Build the room behind every shop door in this playground.
+        OpenInteriors.prebuild(self.loader, self.loader.hood.hoodId)
         for i in self.loader.nodeList:
             self.loader.enterAnimatedProps(i)
 
