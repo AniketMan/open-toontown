@@ -70,9 +70,10 @@ PLANT_BUDGET = ConfigVariableDouble('grass-plant-ms', 5.0).value
 # pond water, sidewalks, steps, hedges.  (Flat decals such as drop shadows,
 # which sit a hair above the ground, do not count.)
 COVER_HEIGHT = 5.0
+SHADOW_CLEARANCE = 0.3  # a see-through sheet this far off the ground is not a painted shadow
 COVER_MIN = -0.02       # paving, pads and roads laid flat on the lawn count as cover
 SHADOW_NAMES = re.compile(r'shad+ow', re.I)
-WATER_NAMES = re.compile(r'water|pond|lake|river|pool', re.I)   # ...but painted shadows do not
+WATER_NAMES = re.compile(r'water|pond|lake|river|pool|ocean', re.I)   # ...but painted shadows do not
 # The baked meadow texture (tools/bake_meadow.py) laid over the painted lawn.
 MEADOW_TEXTURE = 'materials/meadow_detail.png'
 MEADOW_REPEAT = 22.0           # feet per repeat
@@ -512,9 +513,15 @@ class GrassField:
                 continue
             mat = np.getMat(render)
             node = np.node()
+            # Water covers whatever is under it, however deep.
+            isWater = bool(np.hasNetTag('postfx-water') or WATER_NAMES.search(np.getName())
+                           or WATER_NAMES.search(np.getParent().getName())
+                           or any(WATER_NAMES.search(t.getName()) for t in np.findAllTextures()))
             for gi in range(node.getNumGeoms()):
-                if self._isPaintedShadow(np, gi):
-                    continue      # grass grows under a shadow, not around it
+                # Grass grows under a painted shadow, not around it.  But a
+                # shadow lies on the lawn; a see-through sheet standing
+                # clear of the ground is water or glass, and covers it.
+                kind = 1 if isWater else (2 if self._isPaintedShadow(np, gi) else 0)
                 geom = node.getGeom(gi).decompose()
                 vdata = geom.getVertexData()
                 vr = GeomVertexReader(vdata, 'vertex')
@@ -527,8 +534,7 @@ class GrassField:
                 state = np.getNetState().compose(node.getGeomState(gi))
                 trans = state.getAttrib(TransparencyAttrib)
                 attrib = state.getAttrib(TextureAttrib)
-                isWater = np.hasNetTag('postfx-water') or WATER_NAMES.search(np.getName())
-                if (not isWater and trans is not None and trans.getMode() != TransparencyAttrib.MNone
+                if (kind == 0 and trans is not None and trans.getMode() != TransparencyAttrib.MNone
                         and attrib is not None and attrib.getTexture() is not None
                         and vdata.hasColumn('texcoord')):
                     img = self._opacity(attrib.getTexture())
@@ -548,12 +554,12 @@ class GrassField:
                         if abs(det) < 1e-6:
                             continue      # edge-on from above: a wall
                         zlo, zhi = min(a[2], b[2], c[2]), max(a[2], b[2], c[2])
-                        if zhi < gmin[2] + COVER_MIN or zlo > gmax[2] + COVER_HEIGHT:
+                        if zhi < gmin[2] + COVER_MIN or (kind != 1 and zlo > gmax[2] + COVER_HEIGHT):
                             continue
                         n = (b - a).cross(c - a)
                         if not n.normalize() or abs(n[2]) < 0.3:
                             continue
-                        tri = (a, b, c, det, img, (uvs[ia], uvs[ib], uvs[ic]) if img is not None else None)
+                        tri = (a, b, c, det, img, (uvs[ia], uvs[ib], uvs[ic]) if img is not None else None, kind)
                         x0, x1 = min(a[0], b[0], c[0]), max(a[0], b[0], c[0])
                         y0, y1 = min(a[1], b[1], c[1]), max(a[1], b[1], c[1])
                         x0, x1 = max(x0, gmin[0]), min(x1, gmax[0])
@@ -563,13 +569,19 @@ class GrassField:
                                 buckets.setdefault((gx, gy), []).append(tri)
 
         def covered(x, y, z):
-            for a, b, c, det, img, uv in buckets.get((int(math.floor(x / cell)), int(math.floor(y / cell))), ()):
+            for a, b, c, det, img, uv, kind in buckets.get((int(math.floor(x / cell)), int(math.floor(y / cell))), ()):
                 w0 = ((b[1] - c[1]) * (x - c[0]) + (c[0] - b[0]) * (y - c[1])) / det
                 w1 = ((c[1] - a[1]) * (x - c[0]) + (a[0] - c[0]) * (y - c[1])) / det
                 w2 = 1.0 - w0 - w1
                 if w0 < 0 or w1 < 0 or w2 < 0:
                     continue
                 dz = w0 * a[2] + w1 * b[2] + w2 * c[2] - z
+                if kind == 1:
+                    if dz > COVER_MIN:
+                        return True
+                    continue
+                if kind == 2 and dz < SHADOW_CLEARANCE:
+                    continue
                 if COVER_MIN < dz < COVER_HEIGHT:
                     # Only for things lying on the lawn; leaf canopies and
                     # the like overhead keep covering as a whole.
