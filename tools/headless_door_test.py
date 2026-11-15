@@ -38,6 +38,22 @@ def placeState():
 def doors(kind):
     from toontown.building.DistributedDoor import DistributedDoor
     return [d for d in cr.doId2do.values() if isinstance(d, DistributedDoor) and d.doorType in kind]
+TRACK = []
+def stalls(tag):
+    if len(TRACK) < 3: return
+    hand = next((t for t, p, c, h, st in TRACK if h), None)
+    if hand is None: print('STALL', tag, 'no hand-over seen'); del TRACK[:]; return
+    win = [x for x in TRACK if hand - 0.55 <= x[0] <= hand + 0.35]
+    worst = 0; cur = 0; rows = []
+    for a, b in zip(win, win[1:]):
+        d = (b[1] - a[1]).length(); dt = b[0] - a[0]
+        if d < 0.25 * 16.0 * dt: cur += dt
+        else: worst = max(worst, cur); cur = 0
+        cj = (b[2] - a[2]).length() - d
+        if cj > 1.5 or dt > 0.06 or a[4] != b[4]: rows.append('t%+.2f dt %.0fms toon %.1fft cam-extra %.1fft %s' % (b[0] - hand, dt * 1000, d, cj, b[4]))
+    worst = max(worst, cur)
+    print('STALL %s: longest time not moving %.2fs within the window; events: %s' % (tag, worst, ' | '.join(rows[:14]))); sys.stdout.flush()
+    del TRACK[:]
 def drive(task):
     global cr
     if not hasattr(builtins, 'base') or not getattr(base, 'cr', None) or not hasattr(base.cr, 'loginFSM'): return task.cont
@@ -52,7 +68,12 @@ def drive(task):
             if False:
                 im = PNMImage(); base.win.getScreenshot(im); FRAMES.append((fn, im))
                 print('SHOT %s %03d t=%.3f held=%s place=%s' % (S['rec'], S['k'], now, FrameHold.isHeld(), placeState()))
+                v = OI._view; room = OI.roomRoot()
+                try:
+                    print('  VIEW k=%03d owner=%s inside=%s camdist=%.1f toondist=%.1f room=%s roomHiddenForMain=%s roomParent=%s clip=%s viewOutdoors=%s camcoll=%s sunOn=%s indoorOn=%s' % (S['k'], v and v['owner'], v and v['inside'], v['plane'].node().getPlane().distToPlane(base.cam.getPos(render)) if v else 0, v['plane'].node().getPlane().distToPlane(base.localAvatar.getPos(render)) if v else 0, (v['room'].getName() if v and not v['room'].isEmpty() else None), (not (v['room'].node().getDrawShowMask().hasBitsInCommon(BitMask32.bit(0)))) if v and not v['room'].isEmpty() else None, (v['room'].getParent().getName() if v and not v['room'].isEmpty() else None), v['geom'].hasClipPlane(v['plane']) if v else None, OI.viewOutdoors, OI._cameraCollides, base.postFx.sunOn, base.postFx.indoorOn))
+                except Exception as e: print('  VIEW err', repr(e))
         print('REC %s %03d t=%.3f dt=%.0fms held=%s place=%s' % (S['rec'], S['n'] - 1, now, globalClock.getDt() * 1000, FrameHold.isHeld(), placeState())); sys.stdout.flush()
+    if S.get('track') and hasattr(base, 'localAvatar'): TRACK.append((now, base.localAvatar.getPos(render), base.camera.getPos(render), OI.handingOver, placeState()))
     step = S['step']
     if step == 'login':
         if cr.loginFSM.getCurrentState().getName() == 'chooseAvatar' and getattr(cr, 'avChoice', None):
@@ -88,7 +109,7 @@ def drive(task):
         S['rec'] = 'in'; S['n'] = 0; S['k'] = 0
         from direct.showbase.InputStateGlobal import inputState
         S['is'] = inputState
-        log('walking forward'); inputState.set('forward', True); S['step'] = 'entering'; S['t'] = now
+        log('walking forward'); inputState.set('forward', True); S['step'] = 'entering'; S['t'] = now; S['track'] = 1
     elif step == 'entering':
         ps = placeState()
         if now - S.get('lg', 0) > 0.5:
@@ -100,12 +121,12 @@ def drive(task):
         if ps[0] not in (None, S['home']) and ps[1] == 'walk' and not S.get('inside'):
             S['inside'] = now; log('inside walk after %.2fs' % (now - S['t']))
         if S.get('inside') and now - S['inside'] > 1.2 and not S.get('stopped'):
-            S['stopped'] = 1; S['is'].set('forward', False); S['rec'] = None
+            S['stopped'] = 1; S['track'] = 0; stalls('in'); S['is'].set('forward', False); S['rec'] = None
             base.win.saveScreenshot(Filename(out + '/inside.png'))
         if S.get('inside') and now - S['inside'] > 3.0:
             base.localAvatar.setH(base.localAvatar.getH() + 180)
             S['rec'] = 'out'; S['n'] = 0; S['k'] = 0
-            log('walking back out'); S['is'].set('forward', True); S['step'] = 'leaving'; S['t'] = now
+            log('walking back out'); S['is'].set('forward', True); S['step'] = 'leaving'; S['t'] = now; S['track'] = 1
         elif now - S['t'] > 9:
             log('TIMEOUT entering', ps); S['step'] = 'quit'
     elif step == 'leaving':
@@ -116,7 +137,7 @@ def drive(task):
         if ps[0] == S['home'] and ps[1] == 'walk' and not S.get('outside'):
             S['outside'] = now; log('outside walk after %.2fs' % (now - S['t']))
         if S.get('outside') and now - S['outside'] > 1.5 or now - S['t'] > 25:
-            S['is'].set('forward', False)
+            S['track'] = 0; stalls('out'); S['is'].set('forward', False)
             if not S.get('outside'): log('TIMEOUT leaving', ps)
             S['step'] = 'quit'
     elif step == 'quit':
@@ -124,6 +145,17 @@ def drive(task):
         for fn, im in FRAMES: im.write(Filename(fn))
         os._exit(0)
     return task.cont
+import cProfile, pstats, io
+PR = {'p': None, 'n': 0}
+def prof(task):
+    h = OI.handingOver if 'OI' in globals() else False
+    if h and PR['p'] is None and PR['n'] < 2:
+        PR['p'] = cProfile.Profile(); PR['p'].enable()
+    elif PR['p'] is not None and not h and placeState()[1] == 'walk':
+        PR['p'].disable(); out_ = io.StringIO(); pstats.Stats(PR['p'], stream=out_).sort_stats('tottime').print_stats(14)
+        print('PROFILE %d' % PR['n']); print(out_.getvalue()[:2600]); sys.stdout.flush(); PR['p'] = None; PR['n'] += 1
+    return task.cont
+taskMgr.add(prof, 'prof', sort=-1000)
 taskMgr.add(drive, 'drv', sort=100)
 taskMgr.doMethodLater(140, lambda t: os._exit(3), 'bail')
 # appended to the driver: report what OpenInteriors did

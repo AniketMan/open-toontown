@@ -40,6 +40,14 @@ class Walk(StateData.StateData):
     def exit(self):
         self.fsm.request('off')
         self.ignore('control')
+        from toontown.building import OpenInteriors
+        if OpenInteriors.handingOver:
+            # The toon is walking through a shop door.  The street is
+            # handing it over to the room behind the door, but nothing
+            # the player can feel changes: the controls, the camera and
+            # the collisions are left running, and the room picks them
+            # up as they are.
+            return
         base.localAvatar.disableAvatarControls()
         base.localAvatar.stopUpdateSmartCamera()
         base.localAvatar.stopPosHprBroadcast()

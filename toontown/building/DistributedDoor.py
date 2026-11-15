@@ -802,13 +802,13 @@ class DistributedDoor(DistributedObject, DelayDeletable):
         hole.show()
         self.swungOpenAt = globalClock.getFrameTime()
         self.doorTrack = Parallel(SoundInterval(self.openSfx, node=rightDoor),
-                                  LerpHprInterval(nodePath=rightDoor, duration=0.28, hpr=VBase3(h, 0, 0), startHpr=VBase3(0, 0, 0), other=otherNP, blendType='easeOut'),
+                                  LerpHprInterval(nodePath=rightDoor, duration=0.22, hpr=VBase3(h, 0, 0), startHpr=VBase3(0, 0, 0), other=otherNP, blendType='easeOut'),
                                   name='doorSwing-%d' % self.doId)
         self.doorTrack.start()
 
     def isSwungOpen(self):
         at = getattr(self, 'swungOpenAt', None)
-        return at is not None and globalClock.getFrameTime() - at > 0.16
+        return at is not None and globalClock.getFrameTime() - at > 0.10
 
     def exitOpening(self):
         pass

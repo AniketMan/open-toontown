@@ -35,6 +35,8 @@ ShadowCamera = BitMask32.bit(2)
 # How far in front of the doorway the street begins to be drawn: past the
 # wall of the building itself, short of its awning and sign.
 FACADE_DEPTH = 0.35
+CAMERA_REACH = 1.8      # feet in front of the doorway at which the camera counts as through
+ROOM_PICTURE_TONE = (0.80, 0.76, 0.72)
 
 # zone of the room now standing behind its door, or None
 alignedZone = None
@@ -117,11 +119,12 @@ def enterRoom(loader):
     # A street is kept in sections that are put away as the toon moves
     # along it; the ones still fading out when the toon went indoors end
     # up put away for good.  Bring every section back.
-    for section in geom.getStashedChildren():
-        if section.getName().split(':')[0].isdigit():
-            section.unstash()
-            section.clearColorScale()
-            section.clearTransparency()
+    if not handingOver:
+        for section in geom.getStashedChildren():
+            if section.getName().split(':')[0].isdigit():
+                section.unstash()
+                section.clearColorScale()
+                section.clearTransparency()
     geom.setTag('postfx-outside', '1')
     geom.hide(ShadowCamera)
     stashed = []
@@ -155,11 +158,9 @@ def leaveRoom():
         return
     geom, hidden, stashed = _outside
     _outside = None
-    _stopView()
-    for planeNp in hidden:
-        if not geom.isEmpty():
-            geom.clearClipPlane(planeNp)
-        planeNp.removeNode()
+    _stopView(leaving=True)
+    # (the doorway's clip plane belongs to the view, which lets go of it
+    # when the camera is out: _stopView)
     for coll in stashed:
         if not coll.isEmpty():
             coll.unstash()
@@ -207,6 +208,7 @@ def prebuild(loader, branchZone):
     if geom is None or dnaStore is None:
         return
     geom.hide(PortalBit | StreetBit)
+    startApproach()
     _pending = []
     for i in range(dnaStore.getNumBlockNumbers()):
         block = dnaStore.getBlockNumberAt(i)
@@ -243,6 +245,7 @@ def _buildShell(zone, block, kind):
         owner.zoneId = zone
         owner.block = block
         owner.savedBy = None
+        owner.buildingInAdvance = True
         owner.setup()
     except Exception as e:
         notify.warning('could not build room %s in advance: %r' % (zone, e))
@@ -264,8 +267,57 @@ def _buildShell(zone, block, kind):
     _shells[zone] = (shell, owner)
 
 
+def adopt(zoneId):
+    """The server has made the room for this zone.  If it was built in
+    advance, that very room is used: nothing is built twice, nothing
+    changes on screen, and its lighting is already worked out.  Returns
+    the room, or None."""
+    global alignedZone
+    entry = _shells.get(zoneId)
+    if not Enabled or entry is None or entry[0].isEmpty():
+        return None
+    room = entry[0]
+    if room.getParent() != base.render:
+        room.wrtReparentTo(base.render)
+    room.setName(ROOT_NAME)
+    for coll in room.findAllMatches('**/+CollisionNode;+s'):
+        coll.unstash()
+    room.show()
+    if _view is not None and _view['room'] == room:
+        _showRoom(room, bool(_view['inside']))
+    alignedZone = zoneId
+    _adopted.add(zoneId)
+    notify.info('room %s was ready behind its door' % zoneId)
+    if _waitingLoader is not None:
+        enterRoom(_waitingLoader)
+    return room
+
+
+def release(zoneId):
+    """The server has taken the room away again: keep it for next time."""
+    global alignedZone
+    if alignedZone == zoneId:
+        alignedZone = None
+    if zoneId in _held:
+        return      # the camera is still inside it (_stopView)
+    _adopted.discard(zoneId)
+    entry = _shells.get(zoneId)
+    if entry is None or entry[0].isEmpty():
+        return
+    room = entry[0]
+    room.setName('toon-interior-shell')
+    room.show(ViewCameras | ShadowCamera | StreetBit)
+    if not any(z == zoneId for z, _ in _doorways.values()):
+        _storeShell(zoneId)
+
+
+_adopted = set()
+
+
 def _storeShell(zone):
     entry = _shells.get(zone)
+    if zone in _adopted:
+        return      # in use as the real room
     if entry is not None and not entry[0].isEmpty():
         for coll in entry[0].findAllMatches('**/+CollisionNode'):
             coll.stash()
@@ -340,8 +392,11 @@ def doorwayOpened(door, inside=False):
     """A door is swinging open: show what is behind it through the
     doorway.  From the street that is the room built in advance; from
     inside a room (inside=True) it is the street."""
-    if not Enabled or door.doId in _doorways:
+    if not Enabled:
         return
+    if door.doId in _doorways:
+        _closeDoorway(door.doId)      # left over from the last time through
+    _refreshLighting()
     if inside:
         room = roomRoot()
         if not isAligned() or room.isEmpty() or _outside is None:
@@ -362,21 +417,63 @@ def doorwayOpened(door, inside=False):
     if portal is None:
         return
     shell = entry[0]
-    shell.wrtReparentTo(base.render)
+    if shell.getParent() != base.render:
+        shell.wrtReparentTo(base.render)
     shell.show()
-    shell.hide(ViewCameras | ShadowCamera | StreetBit)     # only the doorway picture sees it
+    if not (_view is not None and _view['room'] == shell and _view['inside']):
+        shell.hide(ViewCameras | ShadowCamera | StreetBit)     # only the doorway picture sees it
     # Its floor and walls are solid while the door stands open, so the
     # toon can step in before the server has handed it over.
     for coll in shell.findAllMatches('**/+CollisionNode;+s'):
         coll.unstash()
-    _doorways[door.doId] = (zone, _picturePanels(door, portal))
+    leaf = door.findDoorNode('rightDoor', True)
+    if leaf is not None and not leaf.isEmpty():
+        _leaves[door.doId] = leaf
+    panels = _picturePanels(door, portal)
+    for panel, state in panels:
+        # A room is lit by its lamps, dimmer and warmer than the day
+        # outside; the picture of it is toned to match what the toon
+        # will walk into.
+        panel.setColor(ROOM_PICTURE_TONE[0], ROOM_PICTURE_TONE[1], ROOM_PICTURE_TONE[2], 1, 100)
+    _doorways[door.doId] = (zone, panels)
+
+
+def _refreshLighting():
+    """Has the effects look at the scene again now, so a room's surfaces
+    and lamps are worked out before it is seen rather than after."""
+    fx = getattr(base, 'postFx', None)
+    if fx is not None:
+        fx._materialScanAt = 0.0
+        fx._lamp = None
 
 
 def doorwayClosed(door):
     _closeDoorway(door.doId)
 
 
+_leaves = {}             # door doId -> the leaf that swings open
+_leavesHidden = False
+
+
+def _hideLeaves(hide):
+    """The camera follows the toon through the doorway, and through the
+    open leaf standing in it.  The leaf is left undrawn for that moment."""
+    global _leavesHidden
+    if hide == _leavesHidden:
+        return
+    _leavesHidden = hide
+    for leaf in _leaves.values():
+        if not leaf.isEmpty():
+            if hide:
+                leaf.hide(ViewCameras)
+            else:
+                leaf.show(ViewCameras)
+
+
 def _closeDoorway(doId):
+    leaf = _leaves.pop(doId, None)
+    if leaf is not None and not leaf.isEmpty():
+        leaf.show(ViewCameras)
     entry = _doorways.pop(doId, None)
     if entry is None:
         return
@@ -415,20 +512,55 @@ def _startView(geom, planeNp, room, owner):
     _viewTask(None)
 
 
-def _stopView():
+def _stopView(leaving=False):
     global _view, viewOutdoors
     taskMgr.remove('open-interiors-view')
     v = _view
     _view = None
-    viewOutdoors = None
+    _hideLeaves(False)
     if v is None:
+        viewOutdoors = None
+        _setCameraCollisions(True)
         return
-    if not v['geom'].isEmpty():
-        if not v['plane'].isEmpty():
-            v['geom'].clearClipPlane(v['plane'])
-        v['geom'].show(ShadowCamera)
-    if v['owner'] == 'walk' and not v['plane'].isEmpty():
-        v['plane'].removeNode()
+    geom, planeNp = v['geom'], v['plane']
+
+    def finish():
+        global viewOutdoors
+        viewOutdoors = None
+        if not geom.isEmpty():
+            if not planeNp.isEmpty():
+                geom.clearClipPlane(planeNp)
+            geom.show(ShadowCamera)
+        if not planeNp.isEmpty():
+            planeNp.removeNode()
+        _setCameraCollisions(True)
+        for zone in list(_held):
+            _held.discard(zone)
+            release(zone)
+
+    # Walking out, the camera is still in the room when the toon is handed
+    # back to the street.  Until it has come out too, the room stays up
+    # around it, the street stays cut off at the doorway, and the camera
+    # is left free to follow.
+    if leaving and handingOver and v['inside'] and not planeNp.isEmpty():
+        plane = Plane(planeNp.node().getPlane())
+        until = globalClock.getFrameTime() + 3.0
+        if v['room'] is not None and not v['room'].isEmpty() and alignedZone is not None:
+            _held.add(alignedZone)
+
+        def comeOut(task):
+            if globalClock.getFrameTime() > until or plane.distToPlane(base.cam.getPos(base.render)) > CAMERA_REACH:
+                finish()
+                return task.done
+            _setCameraCollisions(False)
+            return task.cont
+        taskMgr.remove('open-interiors-camera-out')
+        taskMgr.add(comeOut, 'open-interiors-camera-out', sort=46)
+    else:
+        finish()
+
+
+_held = set()            # rooms kept up until the camera has left them
 
 
 def _showRoom(room, inside):
@@ -447,10 +579,15 @@ def _viewTask(task):
         return None if task is None else task.done
     if v['geom'].isEmpty() or v['plane'].isEmpty():
         return None if task is None else task.cont
-    inside = v['plane'].node().getPlane().distToPlane(base.cam.getPos(base.render)) < 0
+    # A stride short of the wall the camera's near edge is already through
+    # it, so the change is made there.
+    camDist = v['plane'].node().getPlane().distToPlane(base.cam.getPos(base.render))
+    inside = camDist < CAMERA_REACH
+    _hideLeaves(-1.0 < camDist < 5.0)
     if inside != v['inside']:
         v['inside'] = inside
         viewOutdoors = not inside
+        _refreshLighting()
         if inside:
             v['geom'].setClipPlane(v['plane'])
             v['geom'].hide(ShadowCamera)
@@ -461,7 +598,44 @@ def _viewTask(task):
             v['geom'].clearClipPlane(v['plane'])
             v['geom'].show(ShadowCamera)
         _showRoom(v['room'], inside)
+    # The game's camera pulls itself in front of any wall between it and
+    # the toon.  With the toon through the doorway and the camera not yet,
+    # that wall is the front of the building, and the camera would leap
+    # eleven feet forward in one frame.  While they are on different
+    # sides (or the toon is in the doorway) the camera is left to follow
+    # straight through.
+    avatar = getattr(base, 'localAvatar', None)
+    if avatar is not None and not avatar.isEmpty():
+        toonInside = v['plane'].node().getPlane().distToPlane(avatar.getPos(base.render)) < 0
+        _setCameraCollisions(toonInside == inside and not _inDoorway)
     return None if task is None else task.cont
+
+
+_cameraCollides = True
+_inDoorway = False
+
+
+def _setCameraCollisions(on):
+    global _cameraCollides
+    avatar = getattr(base, 'localAvatar', None)
+    if avatar is None or not getattr(avatar, '_smartCamEnabled', False):
+        _cameraCollides = True
+        return
+    line = getattr(avatar, 'ccLineNodePath', None)
+    sphere = getattr(avatar, 'ccSphereNodePath', None)
+    if line is None or sphere is None or line.isEmpty() or sphere.isEmpty():
+        return
+    if on and not _cameraCollides:
+        if not avatar.ccTrav.hasCollider(line):
+            avatar.ccTrav.addCollider(line, avatar.camCollisionQueue)
+        if not avatar.cTrav.hasCollider(sphere):
+            avatar.cTrav.addCollider(sphere, avatar.camPusher)
+    elif not on:
+        if avatar.ccTrav.hasCollider(line):
+            avatar.ccTrav.removeCollider(line)
+        if avatar.cTrav.hasCollider(sphere):
+            avatar.cTrav.removeCollider(sphere)
+    _cameraCollides = on
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +704,8 @@ def walkDone(door):
 def endWalk():
     global walk
     taskMgr.remove('open-interiors-walk')
+    global _inDoorway
+    _inDoorway = False
     if walk is not None:
         if not walk['frame'].isEmpty():
             walk['frame'].removeNode()
@@ -586,7 +762,9 @@ def _walkTask(task):
     passable = w['done'] or _doorIsOpen(w['door'])
     # Anywhere across the pair of doors counts: only one leaf opens, and
     # a toon heading for the other is eased across to it.
+    global _inDoorway
     near = passable and abs(lateral) < DOORWAY_REACH and -3.5 < p[1] < 6.0
+    _inDoorway = near
     _setWalls(not near)
     if near and -2.5 < p[1] < 2.5 and abs(lateral) > DOOR_HALF_WIDTH:
         want = max(-DOOR_HALF_WIDTH, min(DOOR_HALF_WIDTH, lateral))
@@ -618,4 +796,100 @@ def _walkTask(task):
     if w['done'] and not handingOver and not near:
         endWalk()
         return task.done
+    return task.cont
+
+
+# ---------------------------------------------------------------------------
+# Doors open as the toon comes up to them.
+#
+# The game opens a door when the toon bumps into it, which means stopping
+# against it first.  Here a shop door is asked to open while the toon is
+# still a few strides off and heading for it, so it stands open by the
+# time the toon gets there and nothing breaks its stride.
+
+APPROACH_FAR = 8.5       # feet in front of the door at which it is asked to open
+APPROACH_SIDE = 3.2      # feet to either side of the open leaf
+_doorList = (0.0, [])
+
+
+def startApproach():
+    if Enabled and not taskMgr.hasTaskNamed('open-interiors-approach'):
+        taskMgr.add(_approachTask, 'open-interiors-approach', sort=43)
+
+
+def _doorPlace(door):
+    """(position, heading, sideways offset of the open leaf) of a door."""
+    cached = getattr(door, 'openInteriorPlace', None)
+    if cached is not None:
+        return cached
+    from toontown.building import DoorTypes
+    place = None
+    if door.doorType == DoorTypes.EXT_STANDARD:
+        street = doorTransform(base.cr.playGame.dnaStore, door.block)
+        if street is not None:
+            place = (Point3(street.getPos()), street.getHpr()[0], door.doorX)
+    else:
+        other = door.getDoorNodePath()
+        if other is not None and not other.isEmpty():
+            place = (other.getPos(base.render), other.getHpr(base.render)[0],
+                     door.doorX * other.getScale(base.render)[0])
+            if isAligned():
+                door.openInteriorPlace = place
+            return place
+    door.openInteriorPlace = place
+    return place
+
+
+def _approachTask(task):
+    global _doorList
+    import math
+    from direct.showbase.InputStateGlobal import inputState
+    avatar = getattr(base, 'localAvatar', None)
+    playGame = getattr(getattr(base, 'cr', None), 'playGame', None)
+    if avatar is None or avatar.isEmpty() or playGame is None or walk is not None:
+        return task.cont
+    place = playGame.getPlace()
+    try:
+        walking = place.fsm.getCurrentState().getName() == 'walk'
+    except Exception:
+        walking = False
+    if not walking or not inputState.isSet('forward'):
+        return task.cont
+    now = globalClock.getFrameTime()
+    if now - _doorList[0] > 0.5:
+        from toontown.building import DoorTypes
+        from toontown.building.DistributedDoor import DistributedDoor
+        doors = [d for d in base.cr.doId2do.values()
+                 if isinstance(d, DistributedDoor) and d.doorType in (DoorTypes.EXT_STANDARD, DoorTypes.INT_STANDARD)]
+        _doorList = (now, doors)
+    pos = avatar.getPos(base.render)
+    heading = math.radians(avatar.getH(base.render))
+    fx, fy = -math.sin(heading), math.cos(heading)
+    for door in _doorList[1]:
+        if door.isEmpty() if hasattr(door, 'isEmpty') else False:
+            continue
+        try:
+            state = door.fsm.getCurrentState().getName()
+        except Exception:
+            continue
+        if state != 'closed' or getattr(door, 'walkThrough', False):
+            continue
+        where = _doorPlace(door)
+        if where is None:
+            continue
+        at, h, offset = where
+        if abs(pos[2] - at[2]) > 4.0:
+            continue
+        dh = math.radians(h)
+        # the door's own axes: +y through the door, +x along the wall
+        ax, ay = math.cos(dh), math.sin(dh)
+        bx, by = -math.sin(dh), math.cos(dh)
+        dx, dy = pos[0] - at[0], pos[1] - at[1]
+        along, through = dx * ax + dy * ay, dx * bx + dy * by
+        if not (-APPROACH_FAR < through < -0.5 and abs(along - offset) < APPROACH_SIDE):
+            continue
+        if fx * bx + fy * by < 0.6:
+            continue        # not heading for it
+        door.doorTrigger()
+        break
     return task.cont

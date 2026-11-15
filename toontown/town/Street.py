@@ -140,8 +140,11 @@ class Street(BattlePlace.BattlePlace):
         return
 
     def exit(self, visibilityFlag = 1):
-        if visibilityFlag:
+        if visibilityFlag and not OpenInteriors.handingOver:
             self.visibilityOff()
+        elif visibilityFlag:
+            # Walking into a shop: the street stays exactly as it is drawn.
+            self.ignore('on-floor')
         if not OpenInteriors.handingOver:
             self.loader.geom.reparentTo(hidden)
         self._telemLimiter.destroy()
@@ -166,7 +169,11 @@ class Street(BattlePlace.BattlePlace):
         self.parentFSM.getStateNamed('street').removeChild(self.fsm)
         del self.parentFSM
         del self.fsm
-        self.enterZone(None)
+        if OpenInteriors.handingOver:
+            # Walking into a shop: the street stays up as it is drawn.
+            self.zoneId = None
+        else:
+            self.enterZone(None)
         cleanupDialog('globalDialog')
         self.ignoreAll()
         BattlePlace.BattlePlace.unload(self)
@@ -315,7 +322,14 @@ class Street(BattlePlace.BattlePlace):
             i.unstash()
 
     def visibilityOn(self):
-        self.hideAllVisibles()
+        if OpenInteriors.handingOver:
+            # Walking out of a shop the street is already drawn as it
+            # should be; putting it all away for a frame would show.  The
+            # sections that should not be up are put away once the toon's
+            # own section is known (doEnterZone).
+            self.tidyAfterWalk = True
+        else:
+            self.hideAllVisibles()
         self.accept('on-floor', self.enterZone)
 
     def visibilityOff(self):
@@ -323,6 +337,12 @@ class Street(BattlePlace.BattlePlace):
         self.showAllVisibles()
 
     def doEnterZone(self, newZoneId):
+        if getattr(self, 'tidyAfterWalk', False) and newZoneId is not None and self.zoneId is None:
+            self.tidyAfterWalk = False
+            keep = self.loader.nodeDict[newZoneId]
+            for i in self.loader.nodeList:
+                if i not in keep:
+                    i.stash()
         if self.zoneId != None:
             for i in self.loader.nodeDict[self.zoneId]:
                 if newZoneId:

@@ -69,6 +69,15 @@ class DistributedPetshopInterior(DistributedObject.DistributedObject):
         return door
 
     def setup(self):
+        # The room built when the street came up is the room: use it.
+        self.adopted = False
+        if (type(self).__name__ in ('DistributedToonInterior', 'DistributedPetshopInterior', 'DistributedGagshopInterior')
+                and not getattr(self, 'buildingInAdvance', False)):
+            ready = OpenInteriors.adopt(self.zoneId)
+            if ready is not None:
+                self.interior = ready
+                self.adopted = True
+                return
         self.dnaStore = base.cr.playGame.dnaStore
         self.randomGenerator = random.Random()
         self.randomGenerator.seed(self.zoneId)
@@ -103,9 +112,16 @@ class DistributedPetshopInterior(DistributedObject.DistributedObject):
         OpenInteriors.place(self.interior, self.zoneId, self.block, dnaStore)
 
     def disable(self):
-        self.fish.stop()
-        self.fish.cleanup()
-        del self.fish
+        if not getattr(self, 'adopted', False):
+            self.fish.stop()
+            self.fish.cleanup()
+            del self.fish
+        if getattr(self, 'adopted', False):
+            # it was built in advance and goes back for next time
+            OpenInteriors.release(self.zoneId)
+            del self.interior
+            DistributedObject.DistributedObject.disable(self)
+            return
         if OpenInteriors.alignedZone == self.zoneId:
             OpenInteriors.alignedZone = None
         self.interior.removeNode()

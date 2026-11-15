@@ -940,6 +940,7 @@ class PostFX(DirectObject):
         self._blobsHidden = False
         self._materialScanAt = 0.0
         self._materialScans = 0
+        self._scan = None
         self._updateMaterialCamera()
 
     def _cleanupMaterials(self):
@@ -974,7 +975,26 @@ class PostFX(DirectObject):
         state = state.addAttrib(TransparencyAttrib.make(TransparencyAttrib.MNone), 1000)
         self.materialCamNode.setInitialState(state)
 
-    def _bindMaterials(self):
+    SCAN_BUDGET = 0.004     # seconds a frame may spend looking at new geometry
+
+    def _bindMaterials(self, everything=False):
+        """Runs the scene scan (_scanScene) a few milliseconds at a time,
+        so walking into a place full of things not seen before (a shop
+        with its keeper, a street's far sections) does not hold a frame
+        up.  Returns True when a scan has been finished."""
+        if self._scan is None:
+            self._scan = self._scanScene()
+        end = globalClock.getRealTime() + (1e9 if everything else self.SCAN_BUDGET)
+        try:
+            while True:
+                next(self._scan)
+                if globalClock.getRealTime() >= end:
+                    return False
+        except StopIteration:
+            self._scan = None
+            return True
+
+    def _scanScene(self):
         """Prepares scene geometry for the material pass.
 
         Geometry appears all the time (zones load, toons walk in), so this
@@ -993,6 +1013,9 @@ class PostFX(DirectObject):
             seen.clear()    # pointers get reused; start over now and then
         bound = 0
         for np in GrassFieldModule.geomNodes(base.render):
+            yield
+            if np.isEmpty():
+                continue
             node = np.node()
             key = (node.this, node.getNumGeoms())
             if key in seen:
@@ -1000,6 +1023,16 @@ class PostFX(DirectObject):
             seen.add(key)
             if np.hasNetTag('postfx-grass') or np.hasNetTag('postfx-water'):
                 continue
+            # Geometry that has been through here is marked on the node
+            # itself, so it is passed over at once however often the scene
+            # is looked at again (walking into a shop looks at it again).
+            # Grass grows under the open sky: on the street, and on the
+            # street still standing outside a shop the toon is in.
+            growing = self.sunOn or np.hasNetTag('postfx-outside')
+            done = np.getPythonTag('postfx-done')
+            if done is not None and done[0] == node.getNumGeoms() and (done[1] or not growing):
+                continue
+            np.setPythonTag('postfx-done', (node.getNumGeoms(), growing))
             if self.water is not None and node.getNumGeoms() and self.water.consider(np):
                 continue
             if self.wantSmooth and self._isCharacter(np):
@@ -1026,7 +1059,7 @@ class PostFX(DirectObject):
                     bound += 1
                     continue
                 entry = None
-                if (self.grass is not None and self.sunOn and not np.hasTag('postfx-grass-done')
+                if (self.grass is not None and growing and not np.hasTag('postfx-grass-done')
                         and self.grass.wantsSurface(np, tex)):
                     self.grass.addSurface(np, i, tex)
                     grassed = True
@@ -1052,7 +1085,7 @@ class PostFX(DirectObject):
                 bound += 1
             if grassed:
                 np.setTag('postfx-grass-done', '1')
-        return bound
+        return
 
     @staticmethod
     def _isBackdrop(np, state):
@@ -1165,10 +1198,10 @@ class PostFX(DirectObject):
             self._materialSize = size
             self.materialBuffer.setSize(size[0], size[1])
         now = globalClock.getRealTime()
-        if now >= self._materialScanAt:
+        if self._scan is not None or now >= self._materialScanAt:
             self._materialScanAt = now + self.MATERIAL_SCAN_INTERVAL
-            self._bindMaterials()
-            self._updateBlobShadows()
+            if self._bindMaterials():
+                self._updateBlobShadows()
         self._updateMaterialCamera()
         quad = self.compositeQuad
         if self.sunOn:
@@ -1351,9 +1384,13 @@ class PostFX(DirectObject):
                     self._materialScanAt = 0.0
             self.sunOn = outdoors
             self.indoorOn = indoors
+            # The shadow maps still hold what the last light saw.  Shadows
+            # are left off for the couple of frames it takes to draw them
+            # again, or stepping out of a shop would flash dark.
+            self._shadowSettle = 3
             self.shadowBuffer.setActive(outdoors or indoors)
             if self.shadowBufferFar is not None:
-                self.shadowBufferFar.setActive(outdoors)
+                self.shadowBufferFar.setActive(outdoors or indoors)
                 if not outdoors:
                     self.compositeQuad.setShaderInput('shadowFar', Vec4(0, 0, 0, 0))
             # The ceiling light looks down through the roof: rooms are
@@ -1415,7 +1452,12 @@ class PostFX(DirectObject):
                                 self.shadowLensFar.getProjectionMat())
             quad.setShaderInput('shadowFar', Vec4(self.SHADOW_FAR_DISTANCE, 1.0 / self.shadowSize, 0, 0))
         quad.setShaderInput('sunDirView', Vec3(toSun[0], toSun[2], toSun[1]))
-        if indoors:
+        settle = getattr(self, '_shadowSettle', 0)
+        if settle > 0:
+            self._shadowSettle = settle - 1
+            quad.setShaderInput('shadowParams', Vec4(0, 1.0 / self.shadowSize, self.SHADOW_EXTENT * 0.55, 0))
+            quad.setShaderInput('shadowFar', Vec4(0, 0, 0, 0))
+        elif indoors:
             quad.setShaderInput('shadowParams',
                                 Vec4(self.INDOOR_SHADOW_STRENGTH,
                                      self.INDOOR_SHADOW_SOFTNESS / self.shadowSize,
