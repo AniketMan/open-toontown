@@ -1,0 +1,50 @@
+B="/Users/aniketbhatt/Documents/GitHub/open-toontown-hd/cog-turnarounds/_hd_build/"
+D=B+"07_Corporate-Raider_Bossbot/"; DS=B+"05_Downsizer_Bossbot/"; HH=B+"06_Head-Hunter_Bossbot/"
+OLD="/private/tmp/claude-501/-Users-aniketbhatt-Documents-GitHub-open-toontown/cf0310ce-0a2b-40d1-bcca-397bd93ed6dc/scratchpad/"
+def rep(s,a,b):
+    assert a in s, a
+    return s.replace(a,b)
+h=open(DS+"work/header_part.py").read()
+h=h[:h.index("# ---------------------------------------------------------------- jacket")]
+h=h.replace("05_Downsizer_Bossbot","07_Corporate-Raider_Bossbot").replace("Downsizer","CorporateRaider").replace("DS_","CR_").replace("ds_ref_","cr_ref_")
+h=rep(h,"576 px = 6.08 game units","467 px = 8.23 game units"); h=rep(h,"suit B's rest pose at native size (game / 0.851)","suit C's rest pose at native size (game / 1.63)")
+h=rep(h,"STRIPE = 0.06\nK = 4.5 / 5.29          # suit B scale for this cog","STRIPE = 0.11\nK = 6.75 / 4.14         # suit C scale for this cog")
+h=rep(h,"e.empty_display_size = 6.4","e.empty_display_size = 8.6")
+h=rep(h,'(0.33, 0.50, 0.44), 0.42, 0.15','(0.80, 0.66, 0.56), 0.42, 0.1')
+h=rep(h,'M_HAND = pmat("CR_Hand", (0.76, 0.60, 0.50)','M_HAND = pmat("CR_Hand", (0.78, 0.47, 0.44)')
+h=h.replace("bscale=110, sheen=0.04","bscale=60, sheen=0.04")
+h=rep(h,"plate, joint, steel, pewter = bmesh.new()",'''M_BLUE = pmat("CR_Blue", (0.13, 0.25, 0.45), 0.45, 0.2, var=0.25, grime=0.4, wear=0.15, bump=0.1, bscale=30, rvar=0.14)
+M_STACHE = pmat("CR_Moustache", (0.62, 0.60, 0.10), 0.4, 0.1, var=0.25, grime=0.5, grime_col=(0.10, 0.11, 0.01), bump=0.05, bscale=40, rvar=0.1, coat=0.2)
+M_PATCH = pmat("CR_Patch", (0.02, 0.018, 0.016), 0.5, var=0.3, bump=0.2, bscale=120, rvar=0.1)
+M_BANDANA = pmat("CR_Bandana", (0.45, 0.03, 0.035), 0.6, 0.1, var=0.25, grime=0.3, wear=0.1, bump=0.15, bscale=60, rvar=0.12)
+M_SPOT = pmat("CR_Spot", (0.82, 0.70, 0.60), 0.55, 0.1, var=0.15, grime=0.3, rvar=0.1)
+M_GOLD = pmat("CR_Gold", (0.75, 0.62, 0.10), 0.3, 0.9, var=0.25, grime=0.4, grime_col=(0.10, 0.12, 0.01), bump=0.05, bscale=60, rvar=0.12)
+plate, joint, steel, pewter = bmesh.new()''')
+h+=open(D+"work/torso_part.py").read()
+mm=open(B+"04_Micromanager_Bossbot/build.py").read()
+a=mm.index("# ---------------------------------------------------------------- limbs"); b=mm.index("# ---------------------------------------------------------------- head")
+limbs=mm[a:b]
+limbs=rep(limbs,'"mm_rig.json"','"cr_rig.json"').replace("MM_","CR_")
+limbs=rep(limbs,"STRIPE = 0.05 / K","STRIPE = 0.11 / K"); limbs=rep(limbs,"\nSTRIPE = 0.05\n","\nSTRIPE = 0.11\n")
+limbs=rep(limbs,"plate_r, joint_r = bmesh.new(), bmesh.new()","plate_r, joint_r, cuff_r = bmesh.new(), bmesh.new(), bmesh.new()")
+limbs=rep(limbs,"lathe(plate_r, c0, ax, [(0.0, 0.243)","lathe(cuff_r, c0, ax, [(0.0, 0.243)")
+limbs=rep(limbs,"puck(plate_r, c0 + ax * 0.20 + n * 0.277","puck(cuff_r, c0 + ax * 0.20 + n * 0.277")
+limbs=rep(limbs,"puck(plate_r, c0 + ax * 0.20 + n * 0.285","puck(cuff_r, c0 + ax * 0.20 + n * 0.285")
+limbs=rep(limbs,"    tag(plate_r, names['wrist'])                                 # cuff","    tag(cuff_r, names['wrist'])\n    tag(plate_r, names['wrist'])                                 # cuff")
+limbs=rep(limbs,'new_obj("CR_HandPlates", plate_r, M_PLATE, 32, rest=True)','new_obj("CR_HandPlates", plate_r, M_HAND, 32, rest=True)\nnew_obj("CR_Cuffs", cuff_r, M_SHIRT, 40, rest=True)')
+open(D+"build.py","w").write(h+limbs+open(D+"work/head_part.py").read())
+r=open(B+"04_Micromanager_Bossbot/rig.py").read()
+r=r.replace(OLD,D).replace("Micromanager (suit C)","Corporate Raider (suit C)").replace('"mm_rig.json"','"cr_rig.json"').replace('collections["Micromanager"]','collections["CorporateRaider"]').replace("MM_","CR_")
+r=rep(r,"RIGID_SIZE = 0.115","RIGID_SIZE = 0.30")
+open(D+"rig.py","w").write(r)
+open(D+"run.py","w").write(open(HH+"run.py").read().replace(HH,D).replace("HH_Rig","CR_Rig").replace("hh_rig","cr_rig"))
+c=open(HH+"check.py").read()
+a=c.index('shot("front"'); b=c.index("(sc.camera, sc.render.resolution_x, sc.render.resolution_y, sc.render.filepath, sc.render.film_transparent) = keep")
+c=c[:a]+open(D+"work/shots_part.py").read()+c[b:]
+c=c.replace(HH,D).replace('"HHCam"','"CRCam"').replace("PXU = 145.0","PXU = 130.0").replace("Head Hunter","Corporate Raider")
+open(D+"check.py","w").write(c)
+open(D+"bake.py","w").write(open(HH+"bake.py").read().replace("06_Head-Hunter_Bossbot","07_Corporate-Raider_Bossbot").replace("HH_Baked","CR_Baked"))
+s=open(D+"build_bam.py").read()
+if "'cr'" not in s:
+    s=rep(s,"'hh': 6.5 / 6.06}","'hh': 6.5 / 6.06, 'cr': 6.75 / 4.14}"); open(D+"build_bam.py","w").write(s)
+print("ok")
